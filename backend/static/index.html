@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Screener (basic test view)</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #0f1115; color: #e5e7eb; margin: 0; padding: 20px; }
+  h1 { font-size: 18px; font-weight: 600; }
+  .status { font-size: 13px; margin-bottom: 12px; }
+  .status.connected { color: #4ade80; }
+  .status.disconnected { color: #f87171; }
+  input { background: #1a1d24; border: 1px solid #333; color: #e5e7eb; padding: 6px 10px; border-radius: 6px; margin-bottom: 12px; width: 240px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #262930; }
+  th { color: #9ca3af; font-weight: 500; cursor: pointer; user-select: none; }
+  th:hover { color: #e5e7eb; }
+  tr.flash { animation: flash 1.5s ease-out; }
+  @keyframes flash { from { background: #2d3a2f; } to { background: transparent; } }
+  .cond-20x { color: #f87171; }
+  .cond-10x { color: #fbbf24; }
+</style>
+</head>
+<body>
+
+<h1>Screener — today's hits (basic test view)</h1>
+<div id="status" class="status disconnected">Connecting...</div>
+<input id="search" type="text" placeholder="Search symbol...">
+<table>
+  <thead>
+    <tr>
+      <th data-key="trading_symbol">Symbol</th>
+      <th data-key="ltp">LTP</th>
+      <th data-key="multiple">Multiple</th>
+      <th data-key="value">Value (₹)</th>
+      <th data-key="condition_matched">Condition</th>
+      <th data-key="occurrence_count">Occurrences</th>
+      <th data-key="last_triggered_at">Last Triggered</th>
+    </tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+
+<script>
+// This is a deliberately minimal, no-build-step page — plain JS, no
+// framework — built to prove the backend's REST + WebSocket pipeline
+// actually works end-to-end before investing time in the real React
+// app. Once this confirms the plumbing, the React version replaces it
+// with the same two data sources (GET /screener/today, WS /ws/screener).
+
+const API_BASE = window.location.origin;
+let rowsData = [];
+let sortKey = "last_triggered_at";
+let sortDesc = true;
+const rowElements = new Map(); // trading_symbol -> <tr> element, kept stable across renders
+
+function fmtValue(v) {
+  return "₹" + Number(v).toLocaleString("en-IN", { maximumFractionDigits: 0 });
+}
+
+function fillRow(tr, row) {
+  const condClass = row.condition_matched === "20x_4cr" ? "cond-20x" : "cond-10x";
+  tr.innerHTML = `
+    <td>${row.trading_symbol}</td>
+    <td>${row.ltp}</td>
+    <td>${Number(row.multiple).toFixed(1)}x</td>
+    <td>${fmtValue(row.value)}</td>
+    <td class="${condClass}">${row.condition_matched}</td>
+    <td>${row.occurrence_count}</td>
+    <td>${new Date(row.last_triggered_at).toLocaleTimeString("en-IN")}</td>
+  `;
+}
+
+function render() {
+  const searchTerm = document.getElementById("search").value.toLowerCase();
+  let filtered = rowsData.filter(r => r.trading_symbol.toLowerCase().includes(searchTerm));
+
+  filtered.sort((a, b) => {
+    let av = a[sortKey], bv = b[sortKey];
+    if (typeof av === "string") { av = av.toLowerCase(); bv = bv.toLowerCase(); }
+    if (av < bv) return sortDesc ? 1 : -1;
+    if (av > bv) return sortDesc ? -1 : 1;
+    return 0;
+  });
+
+  const tbody = document.getElementById("rows");
+  const visibleSymbols = new Set(filtered.map(r => r.trading_symbol));
+
+  // Remove DOM rows for symbols no longer in the filtered set (e.g. search narrowed them out)
+  for (const [symbol, tr] of rowElements) {
+    if (!visibleSymbols.has(symbol)) {
+      tr.remove();
+      rowElements.delete(symbol);
+    }
+  }
+
+  // Reuse existing <tr> elements where possible (updated in place, not
+  // torn down) — only creates a new element for a genuinely new
+  // symbol. This is what stops unrelated rows from flickering: a row
+  // whose data hasn't changed is never removed from the DOM, so the
+  // browser has nothing to visually redraw for it.
+  let previousNode = null;
+  for (const row of filtered) {
+    let tr = rowElements.get(row.trading_symbol);
+    if (!tr) {
+      tr = document.createElement("tr");
+      rowElements.set(row.trading_symbol, tr);
+    }
+    fillRow(tr, row);
+
+    // Ensure correct order in the DOM without rebuilding — insert
+    // right after the previous row in sorted order.
+    if (previousNode) previousNode.after(tr);
+    else tbody.prepend(tr);
+    previousNode = tr;
+  }
+}
+
+function flashRow(symbol) {
+  const tr = rowElements.get(symbol);
+  if (!tr) return;
+  tr.classList.remove("flash"); // restart animation if it's already mid-flash
+  void tr.offsetWidth; // force reflow so the removed class actually takes effect before re-adding
+  tr.classList.add("flash");
+}
+
+function upsertRow(newRow) {
+  const idx = rowsData.findIndex(r => r.trading_symbol === newRow.trading_symbol);
+  // Merge rather than replace — protects existing fields (like
+  // first_triggered_at) that a live-push payload might not include,
+  // instead of wiping them to undefined.
+  if (idx >= 0) rowsData[idx] = { ...rowsData[idx], ...newRow };
+  else rowsData.unshift(newRow);
+  render();
+  flashRow(newRow.trading_symbol);
+}
+
+document.querySelectorAll("th").forEach(th => {
+  th.addEventListener("click", () => {
+    const key = th.dataset.key;
+    if (sortKey === key) sortDesc = !sortDesc;
+    else { sortKey = key; sortDesc = true; }
+    render();
+  });
+});
+
+document.getElementById("search").addEventListener("input", render);
+
+async function loadInitial() {
+  const res = await fetch(`${API_BASE}/screener/today`);
+  rowsData = await res.json();
+  render();
+}
+
+function connectWebSocket() {
+  const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/screener`);
+
+  ws.onopen = () => {
+    document.getElementById("status").textContent = "Connected — live";
+    document.getElementById("status").className = "status connected";
+  };
+  ws.onclose = () => {
+    document.getElementById("status").textContent = "Disconnected — retrying in 3s...";
+    document.getElementById("status").className = "status disconnected";
+    setTimeout(connectWebSocket, 3000);
+  };
+  ws.onmessage = (event) => {
+    const alert = JSON.parse(event.data);
+    upsertRow(alert);
+  };
+}
+
+loadInitial();
+connectWebSocket();
+</script>
+
+</body>
+</html>

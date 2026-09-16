@@ -1,0 +1,9 @@
+# One date per line, YYYY-MM-DD format.
+# Fill this in from NSE's official trading holiday calendar
+# (published each December for the following year, on nseindia.com).
+# Example:
+# 2026-01-26
+# 2026-03-14
+# 2026-08-15
+# 2026-10-02
+# 2026-11-01

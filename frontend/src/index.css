@@ -1,0 +1,83 @@
+/*
+  Design approach: this is a working tool for traders watching a
+  live-updating table of numbers, not a marketing page — so the
+  table IS the interface, not a hero banner leading into content.
+  Numbers are right-aligned and set in a monospaced numeral face
+  (IBM Plex Mono) so magnitudes line up like a ledger and are easy
+  to scan; IBM Plex Sans handles everything else, chosen as a
+  coherent superfamily with the mono face rather than two unrelated
+  typefaces. Color is reserved for meaning only: two accent hues
+  distinguish which screener condition fired (a stricter multiplier
+  vs a looser one with a higher value floor), and green/red carry
+  price direction — nothing else uses color.
+*/
+
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+:root {
+  --bg: #0b0e14;
+  --surface: #12161f;
+  --border: #232838;
+  --text: #e6e9ef;
+  --text-muted: #7c8494;
+  --accent-strict: #ff6b5b;   /* condition: 20x + >4Cr (stricter multiplier) */
+  --accent-loose: #f5a623;    /* condition: 10x + >6Cr (higher value floor) */
+  --positive: #3dd68c;
+  --negative: #ff5c5c;
+  --focus: #5b8cff;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.mono {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+a { color: inherit; }
+
+button {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+button:hover { border-color: var(--focus); }
+button:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+input {
+  font-family: inherit;
+  font-size: 13px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+input::placeholder { color: var(--text-muted); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+
+.chart-icon-btn:hover { color: var(--focus); }

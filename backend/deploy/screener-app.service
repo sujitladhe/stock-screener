@@ -1,0 +1,19 @@
+[Unit]
+Description=Screener App (backend + frontend, single process)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Screener_project/backend
+ExecStart=/home/ubuntu/Screener_project/backend/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/screener_app.log
+StandardError=append:/var/log/screener_app.log
+
+# Deliberately NOT enabled at boot and NOT set to auto-restart forever
+# on its own schedule -- cron controls exactly when this starts/stops
+# (see crontab entries), matching the 9:14 AM - 3:31 PM Mon-Fri window.
+[Install]
+WantedBy=multi-user.target
