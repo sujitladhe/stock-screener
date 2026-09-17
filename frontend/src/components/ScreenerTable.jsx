@@ -15,6 +15,21 @@ import AddToWatchlistModal from "./AddToWatchlistModal";
  * removed per product decision - condition_matched is still present
  * in the row data but no longer rendered.
  */
+
+// % change is DERIVED (ltp vs prev_close), not a field on the row
+// itself -- so sorting by it needs its own accessor rather than a
+// plain row[sortKey] lookup (which would always be undefined for
+// "pct_change" and silently no-op the sort).
+function getSortValue(row, key) {
+  if (key === "pct_change") {
+    if (row.prev_close === null || row.prev_close === undefined || row.prev_close === 0) {
+      return -Infinity; // stocks with no baseline sort to the bottom, consistently
+    }
+    return ((row.ltp - row.prev_close) / row.prev_close) * 100;
+  }
+  return row[key];
+}
+
 export default function ScreenerTable({ rows, flashRowId, emptyMessage, stockColors = {}, onWatchlistChanged }) {
   const [search, setSearch] = useState("");
   const [sortKey, setSortKey] = useState("last_triggered_at");
@@ -25,7 +40,7 @@ export default function ScreenerTable({ rows, flashRowId, emptyMessage, stockCol
     const term = search.toLowerCase();
     const list = rows.filter((r) => r.trading_symbol.toLowerCase().includes(term));
     return list.sort((a, b) => {
-      let av = a[sortKey], bv = b[sortKey];
+      let av = getSortValue(a, sortKey), bv = getSortValue(b, sortKey);
       if (typeof av === "string") { av = av.toLowerCase(); bv = bv.toLowerCase(); }
       if (av < bv) return sortDesc ? 1 : -1;
       if (av > bv) return sortDesc ? -1 : 1;
