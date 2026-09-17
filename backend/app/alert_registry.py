@@ -40,6 +40,7 @@ def add_alert(alert) -> None:
         condition_2_operator=alert.condition_2_operator,
         condition_2_threshold=float(alert.condition_2_threshold) if alert.condition_2_threshold is not None else None,
         combinator=alert.combinator,
+        sound_enabled=alert.sound_enabled,   
     )
     remove_alert(alert.id)
     _registry.setdefault(alert.trading_symbol, []).append(state)

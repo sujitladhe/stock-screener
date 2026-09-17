@@ -51,6 +51,8 @@ class AlertRuntimeState:
     condition_2_threshold: Optional[float] = None
     combinator: Optional[str] = None  # "AND" or "OR" -- only meaningful if condition_2 is set
 
+    sound_enabled: bool = True
+
     prev_price: Optional[float] = None
     prev_value: Optional[float] = None  # current-minute volume * price, same "value" concept as the screener
 
