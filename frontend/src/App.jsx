@@ -6,9 +6,11 @@ import Watchlist from "./pages/Watchlist";
 import Alerts from "./pages/Alerts";
 import Orders from "./pages/Orders";
 import Positions from "./pages/Positions";
+import ToastStack from "./components/ToastStack";
 import { getCurrentSession } from "./api";
 import { useScreenerSocket } from "./hooks/useScreenerSocket";
 import { useStockColors } from "./hooks/useStockColors";
+import { usePositions } from "./hooks/usePositions";
 import { showAlertNotification } from "./browserNotify";
 import { playAlertSound } from "./soundAlert";
 
@@ -42,60 +44,83 @@ export default function App() {
   // disconnecting/reconnecting every time.
   const { rows, connectionStatus, flashRowId } = useScreenerSocket(!!clientId, handleUserAlert);
   const { stockColors, refetchStockColors } = useStockColors(!!clientId);
+  // Lifted here (not inside Positions.jsx) so the Screener page's
+  // Open P&L widget and the Positions page itself share the SAME
+  // polling interval and data, instead of each page opening its own
+  // independent poll against the broker.
+  const { openPositions, closedPositions, totalOpenPnl, loading: positionsLoading, error: positionsError, refetchPositions } = usePositions(!!clientId);
 
   if (clientId === undefined) {
     return <div style={{ padding: 24, color: "var(--text-muted)" }}>Loading...</div>;
   }
 
   if (!clientId) {
-    return <Login onLoggedIn={setClientId} />;
+    return (
+      <>
+        <Login onLoggedIn={setClientId} />
+        <ToastStack />
+      </>
+    );
   }
 
+  let page;
+
   if (view === "history") {
-    return (
+    page = (
       <History
         onNavigateLive={() => setView("screener")}
         stockColors={stockColors}
         onWatchlistChanged={refetchStockColors}
       />
     );
-  }
-
-  if (view === "watchlist") {
-    return <Watchlist onNavigateLive={() => setView("screener")} onChanged={refetchStockColors} />;
-  }
-
-  if (view === "alerts") {
-    return (
+  } else if (view === "watchlist") {
+    page = <Watchlist onNavigateLive={() => setView("screener")} onChanged={refetchStockColors} />;
+  } else if (view === "alerts") {
+    page = (
       <Alerts
         onNavigateLive={() => setView("screener")}
         refreshSignal={alertRefreshSignal}
       />
     );
-  }
-
-  if (view === "orders") {
-    return <Orders onNavigateLive={() => setView("screener")} />;
-  }
-
-  if (view === "positions") {
-    return <Positions onNavigateLive={() => setView("screener")} />;
+  } else if (view === "orders") {
+    page = <Orders onNavigateLive={() => setView("screener")} />;
+  } else if (view === "positions") {
+    page = (
+      <Positions
+        onNavigateLive={() => setView("screener")}
+        openPositions={openPositions}
+        closedPositions={closedPositions}
+        totalOpenPnl={totalOpenPnl}
+        loading={positionsLoading}
+        error={positionsError}
+        refetchPositions={refetchPositions}
+      />
+    );
+  } else {
+    page = (
+      <Screener
+        clientId={clientId}
+        onLoggedOut={() => setClientId(null)}
+        onNavigateHistory={() => setView("history")}
+        onNavigateWatchlist={() => setView("watchlist")}
+        onNavigateAlerts={() => setView("alerts")}
+        onNavigateOrders={() => setView("orders")}
+        onNavigatePositions={() => setView("positions")}
+        rows={rows}
+        connectionStatus={connectionStatus}
+        flashRowId={flashRowId}
+        stockColors={stockColors}
+        onWatchlistChanged={refetchStockColors}
+        totalOpenPnl={totalOpenPnl}
+        openPositionsCount={openPositions.length}
+      />
+    );
   }
 
   return (
-    <Screener
-      clientId={clientId}
-      onLoggedOut={() => setClientId(null)}
-      onNavigateHistory={() => setView("history")}
-      onNavigateWatchlist={() => setView("watchlist")}
-      onNavigateAlerts={() => setView("alerts")}
-      onNavigateOrders={() => setView("orders")}
-      onNavigatePositions={() => setView("positions")}
-      rows={rows}
-      connectionStatus={connectionStatus}
-      flashRowId={flashRowId}
-      stockColors={stockColors}
-      onWatchlistChanged={refetchStockColors}
-    />
+    <>
+      {page}
+      <ToastStack />
+    </>
   );
 }

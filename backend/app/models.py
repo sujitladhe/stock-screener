@@ -6,15 +6,41 @@ Instrument is the shared NSE equity master list (common across all
 users, per the architecture doc). We'll add VolumeAverage, Watchlist,
 ScreenerCondition, etc. as we build those phases — deliberately not
 creating empty placeholder tables for features we haven't built yet.
+
+TIMESTAMP CONVENTION: per this project's own IST-discipline principle
+(see Section 3 of the handoff doc — "timezone bugs are a recurring
+risk"), every wall-clock timestamp a person will actually SEE (order
+placement time, alert trigger time, etc.) is stored as a naive
+datetime that VALUES Indian time, not UTC — matching how
+live_engine.py's tick.timestamp is already handled (parsed directly
+from Ventura's IST-valued feed, stored naive). now_ist_naive() below
+is the one helper for producing these; nothing in this file should use
+bare datetime.utcnow() for a timestamp a person will read. Purely
+internal bookkeeping fields (created_at housekeeping, session
+last-active tracking) are lower-stakes and left as UTC where they
+already were, to avoid touching more than this fix needs.
 """
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import Column, String, DateTime, Boolean, Integer, Numeric, UniqueConstraint, Date
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
 
 from app.database import Base
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def now_ist_naive() -> datetime:
+    """
+    Current Indian wall-clock time, as a naive datetime (no tzinfo) —
+    matching the convention already used for tick.timestamp elsewhere
+    in this app. Use this for any stored timestamp a person will see
+    displayed (order placed_at, status-check times, etc.).
+    """
+    return datetime.now(IST).replace(tzinfo=None)
 
 
 class UserSession(Base):
@@ -44,6 +70,18 @@ class UserSession(Base):
     ventura_auth_expiry = Column(DateTime, nullable=True)
     ventura_refresh_token = Column(String, nullable=True)
     ventura_refresh_expiry = Column(DateTime, nullable=True)
+
+    # The IST calendar date (not a timestamp) the Ventura auth_token
+    # was last (re)obtained on. Ventura's own docs don't state
+    # explicitly whether a token obtained on one trading day is
+    # expected to work on the next, and a real relogin failure was
+    # observed after a token sat unused for a while — so rather than
+    # trust ventura_auth_expiry alone, get_current_session also forces
+    # a fresh login whenever this date isn't today's IST date, however
+    # far off auth_expiry still claims to be. Nullable so existing
+    # rows (from before this column existed) just trigger one relogin
+    # the next time they're used, rather than needing a backfill.
+    ventura_token_refreshed_date = Column(Date, nullable=True)
 
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -265,6 +303,11 @@ class Order(Base):
     "today's," we refresh `status` by polling the broker's Order Book;
     once the day ends, status is frozen at whatever was last known,
     since the broker stops telling us more.
+
+    placed_at/last_status_check_at store IST (see now_ist_naive above)
+    — these were originally UTC (datetime.utcnow), which is what made
+    "Order Placed timing is not Indian time" a real, reported bug
+    rather than just a display quirk. Fixed here at the source.
     """
     __tablename__ = "orders"
 
@@ -294,7 +337,7 @@ class Order(Base):
     status = Column(String, nullable=False, default="Pending")  # mirrors Ventura's own status strings (Pending/Executed/Cancelled/Rejected/...)
     broker_message = Column(String, nullable=True)  # success confirmation OR rejection reason, whichever Ventura sent
 
-    placed_at = Column(DateTime, default=datetime.utcnow)
+    placed_at = Column(DateTime, default=now_ist_naive)
     last_status_check_at = Column(DateTime, nullable=True)
 
 

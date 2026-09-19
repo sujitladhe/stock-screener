@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
-from app.models import UserSession
+from app.models import UserSession, now_ist_naive
 from app.security import encrypt, generate_session_token
 from app import ventura_client
 from app.dependencies import get_current_session
@@ -65,6 +65,11 @@ def login(req: LoginRequest, response: Response, db: Session = Depends(get_db)):
         ventura_auth_expiry=_parse_ventura_datetime(token_data.get("auth_expiry")),
         ventura_refresh_token=token_data.get("refresh_token"),
         ventura_refresh_expiry=_parse_ventura_datetime(token_data.get("refresh_expiry")),
+        # Keeps a fresh login consistent with get_current_session's
+        # day-boundary check — without this, a session created late at
+        # night could otherwise be treated as "stale for today" on its
+        # very first real request.
+        ventura_token_refreshed_date=now_ist_naive().date(),
     )
     db.add(session_row)
     db.commit()

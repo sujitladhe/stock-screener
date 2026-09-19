@@ -1,5 +1,18 @@
 import { useState } from "react";
 import { placeStoplossOrder } from "../api";
+import { showToast } from "../toast";
+
+// Same fix as PlaceOrderModal.jsx: product options are scoped to
+// order kind, and changing kind auto-syncs product, rather than
+// letting them drift out of sync (which caused a real Ventura
+// rejection: "EXCH: Not Specified").
+const PRODUCTS_BY_KIND = {
+  delivery: [{ value: "C", label: "C — CNC (delivery)" }],
+  intraday: [
+    { value: "I", label: "I — Intraday" },
+    { value: "M", label: "M — Margin" },
+  ],
+};
 
 /**
  * Sets a stoploss (exit) order for a currently-held position.
@@ -26,6 +39,13 @@ export default function StoplossModal({ position, defaultTransactionType, onClos
   const [product, setProduct] = useState("I");
   const [error, setError] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+
+  const productOptions = PRODUCTS_BY_KIND[orderKind];
+
+  function handleOrderKindChange(kind) {
+    setOrderKind(kind);
+    setProduct(kind === "delivery" ? "C" : "I");
+  }
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -57,9 +77,11 @@ export default function StoplossModal({ position, defaultTransactionType, onClos
         order_kind: orderKind,
         product,
       });
+      showToast(`Stoploss order for ${position.symbol} placed successfully.`, "success");
       if (onPlaced) onPlaced();
       onClose();
     } catch (err) {
+      showToast(`Stoploss order for ${position.symbol} failed: ${err.message}`, "error");
       setError(err.message);
     } finally {
       setSubmitting(false);
@@ -110,18 +132,15 @@ export default function StoplossModal({ position, defaultTransactionType, onClos
         <div style={styles.row}>
           <label style={styles.field}>
             <span style={styles.label}>Order kind</span>
-            <select value={orderKind} onChange={(e) => setOrderKind(e.target.value)}>
-              <option value="intraday">Intraday</option>
-              <option value="delivery">Delivery</option>
-            </select>
+            <ToggleGroup value={orderKind} onChange={handleOrderKindChange} options={[
+              { value: "intraday", label: "Intraday" },
+              { value: "delivery", label: "Delivery" },
+            ]} />
           </label>
           <label style={styles.field}>
             <span style={styles.label}>Product</span>
             <select value={product} onChange={(e) => setProduct(e.target.value)}>
-              <option value="I">I — Intraday</option>
-              <option value="C">C — CNC (delivery)</option>
-              <option value="M">M — Margin</option>
-              <option value="F">F — Futures</option>
+              {productOptions.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
             </select>
           </label>
         </div>
@@ -133,6 +152,28 @@ export default function StoplossModal({ position, defaultTransactionType, onClos
         </button>
         <button type="button" style={styles.closeBtn} onClick={onClose}>Cancel</button>
       </form>
+    </div>
+  );
+}
+
+function ToggleGroup({ value, onChange, options }) {
+  return (
+    <div style={styles.toggleGroup}>
+      {options.map((opt) => (
+        <button
+          type="button"
+          key={opt.value}
+          onClick={() => onChange(opt.value)}
+          style={{
+            ...styles.toggleBtn,
+            background: value === opt.value ? "var(--focus)" : "var(--surface)",
+            color: value === opt.value ? "#fff" : "var(--text)",
+            borderColor: value === opt.value ? "var(--focus)" : "var(--border)",
+          }}
+        >
+          {opt.label}
+        </button>
+      ))}
     </div>
   );
 }
@@ -152,6 +193,8 @@ const styles = {
   row: { display: "flex", gap: 10 },
   field: { display: "flex", flexDirection: "column", gap: 4, flex: 1 },
   label: { fontSize: 11, color: "var(--text-muted)" },
+  toggleGroup: { display: "flex", gap: 4 },
+  toggleBtn: { flex: 1, padding: "7px 0", fontSize: 11, border: "1px solid" },
   error: {
     fontSize: 12, color: "var(--negative)", background: "rgba(255, 92, 92, 0.1)",
     border: "1px solid rgba(255, 92, 92, 0.3)", borderRadius: 6, padding: "6px 10px",

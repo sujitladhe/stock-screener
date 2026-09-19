@@ -6,6 +6,19 @@ const STATUS_LABELS = {
   reconnecting: "Reconnecting",
 };
 
+function OpenPnlWidget({ totalOpenPnl, openPositionsCount, onClick }) {
+  if (!openPositionsCount) return null;
+  const isPositive = totalOpenPnl >= 0;
+  return (
+    <div style={styles.pnlWidget} onClick={onClick} title="Open positions P&L — click to view positions">
+      <span style={styles.pnlLabel}>Open P&amp;L</span>
+      <span className="mono" style={{ color: isPositive ? "var(--positive)" : "var(--negative)", fontWeight: 600 }}>
+        {isPositive ? "+" : ""}{totalOpenPnl.toLocaleString("en-IN", { maximumFractionDigits: 2 })}
+      </span>
+    </div>
+  );
+}
+
 // Note: the live socket state and stockColors are owned by App.jsx,
 // not this component — passed down as props — so they survive
 // navigating between pages instead of resetting.
@@ -13,6 +26,7 @@ export default function Screener({
   clientId, onLoggedOut, onNavigateHistory, onNavigateWatchlist, onNavigateAlerts,
   onNavigateOrders, onNavigatePositions,
   rows, connectionStatus, flashRowId, stockColors, onWatchlistChanged,
+  totalOpenPnl, openPositionsCount,
 }) {
   async function handleLogout() {
     await logout();
@@ -39,6 +53,7 @@ export default function Screener({
           <span style={styles.navLink} onClick={onNavigatePositions}>Positions</span>
         </nav>
         <div style={styles.headerRight}>
+          <OpenPnlWidget totalOpenPnl={totalOpenPnl} openPositionsCount={openPositionsCount} onClick={onNavigatePositions} />
           <span style={styles.clientId}>{clientId}</span>
           <button onClick={handleLogout}>Sign out</button>
         </div>
@@ -75,6 +90,12 @@ const styles = {
   nav: { display: "flex", gap: 16, fontSize: 13 },
   navActive: { color: "var(--text)", fontWeight: 500, borderBottom: "2px solid var(--focus)", paddingBottom: 2 },
   navLink: { color: "var(--text-muted)", cursor: "pointer", paddingBottom: 2 },
-  headerRight: { display: "flex", alignItems: "center", gap: 12, marginLeft: "auto" },
+  headerRight: { display: "flex", alignItems: "center", gap: 14, marginLeft: "auto" },
   clientId: { fontSize: 12, color: "var(--text-muted)" },
+  pnlWidget: {
+    display: "flex", alignItems: "center", gap: 6, cursor: "pointer",
+    background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 6,
+    padding: "5px 10px", fontSize: 12,
+  },
+  pnlLabel: { color: "var(--text-muted)" },
 };

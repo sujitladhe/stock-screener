@@ -1,5 +1,4 @@
-import { useState, useEffect } from "react";
-import { getPositions } from "../api";
+import { useState } from "react";
 import StoplossModal from "../components/StoplossModal";
 
 /**
@@ -22,10 +21,10 @@ function normalizePosition(raw) {
     profitLoss: raw.profit_loss ?? null,
     productType: raw.product_type ?? null,
     // A short position (signed quantity < 0) needs a BUY to exit; a
-    // long position (quantity > 0) needs a SELL. This is now derived
-    // with confidence from the confirmed, signed total_quantity field
-    // -- StoplossModal still shows it as an editable default rather
-    // than locking it, so a mistaken read never becomes unchangeable.
+    // long position (quantity > 0) needs a SELL. This is derived with
+    // confidence from the confirmed, signed total_quantity field --
+    // StoplossModal still shows it as an editable default rather than
+    // locking it, so a mistaken read never becomes unchangeable.
     exitTransactionType: quantity != null ? (quantity < 0 ? "B" : "S") : null,
   };
 }
@@ -41,28 +40,11 @@ function PnL({ value }) {
   );
 }
 
-export default function Positions({ onNavigateLive }) {
-  const [openPositions, setOpenPositions] = useState([]);
-  const [closedPositions, setClosedPositions] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+export default function Positions({ onNavigateLive, openPositions: rawOpen, closedPositions: rawClosed, totalOpenPnl, loading, error, refetchPositions }) {
   const [stoplossTarget, setStoplossTarget] = useState(null);
 
-  function reload() {
-    setLoading(true);
-    setError(null);
-    getPositions()
-      .then((data) => {
-        setOpenPositions((data.open_positions || []).map(normalizePosition));
-        setClosedPositions((data.closed_positions || []).map(normalizePosition));
-      })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
-  }
-
-  useEffect(reload, []);
-
-  const totalOpenPnl = openPositions.reduce((sum, p) => sum + (Number(p.profitLoss) || 0), 0);
+  const openPositions = (rawOpen || []).map(normalizePosition);
+  const closedPositions = (rawClosed || []).map(normalizePosition);
 
   return (
     <div style={styles.page}>
@@ -74,6 +56,7 @@ export default function Positions({ onNavigateLive }) {
         {openPositions.length > 0 && (
           <div style={styles.totalPnl}>
             Open P&amp;L: <PnL value={totalOpenPnl} />
+            <span style={styles.liveTag}>live</span>
           </div>
         )}
       </header>
@@ -152,7 +135,7 @@ export default function Positions({ onNavigateLive }) {
           position={stoplossTarget}
           defaultTransactionType={stoplossTarget.exitTransactionType}
           onClose={() => setStoplossTarget(null)}
-          onPlaced={reload}
+          onPlaced={refetchPositions}
         />
       )}
     </div>
@@ -168,7 +151,11 @@ const styles = {
   nav: { display: "flex", gap: 16, fontSize: 13 },
   navActive: { color: "var(--text)", fontWeight: 500, borderBottom: "2px solid var(--focus)", paddingBottom: 2 },
   navLink: { color: "var(--text-muted)", cursor: "pointer", paddingBottom: 2 },
-  totalPnl: { marginLeft: "auto", fontSize: 13 },
+  totalPnl: { marginLeft: "auto", fontSize: 13, display: "flex", alignItems: "center", gap: 6 },
+  liveTag: {
+    fontSize: 9, color: "var(--positive)", border: "1px solid var(--positive)",
+    borderRadius: 4, padding: "1px 4px", textTransform: "uppercase", letterSpacing: "0.03em",
+  },
   sectionTitle: { fontSize: 13, fontWeight: 600, marginBottom: 10 },
   error: {
     fontSize: 12, color: "var(--negative)", background: "rgba(255, 92, 92, 0.1)",

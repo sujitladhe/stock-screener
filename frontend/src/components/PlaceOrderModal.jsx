@@ -1,18 +1,29 @@
 import { useState, useMemo } from "react";
 import { placeOrder } from "../api";
+import { showToast } from "../toast";
 
 const ORDER_TYPES = ["MKT", "LMT", "SL", "SLM"];
-const PRODUCTS = [
-  { value: "C", label: "C — CNC (delivery)" },
-  { value: "I", label: "I — Intraday" },
-  { value: "M", label: "M — Margin" },
-  { value: "F", label: "F — Futures" },
-];
+
+// Product options are scoped to order kind, not a flat shared list --
+// a real order was rejected by Ventura ("EXCH: Not Specified") when
+// Delivery was selected but the product dropdown still held its
+// Intraday default. Restricting the choices per kind (rather than
+// just defaulting them) makes that mismatch structurally impossible.
+const PRODUCTS_BY_KIND = {
+  delivery: [{ value: "C", label: "C — CNC (delivery)" }],
+  intraday: [
+    { value: "I", label: "I — Intraday" },
+    { value: "M", label: "M — Margin" },
+  ],
+};
 
 /**
  * General order-entry modal — opened from a screener/watchlist row
  * (prefilled symbol + last-known LTP as the stoploss-calc reference
- * price) or from the Orders page's "New order" button (blank).
+ * price), from the Orders page's "New order" search, or from
+ * "Reorder" on a cancelled/rejected order (prefillOrder carries that
+ * order's full field set so it reopens as a fresh, editable order —
+ * never re-submits the old one, just starts from its values).
  *
  * Stoploss-based quantity (requirement 6d): entering a stoploss value
  * and percentage computes quantity as
@@ -23,26 +34,42 @@ const PRODUCTS = [
  * The computed value fills the quantity field but stays a normal,
  * editable input afterward — it's a starting point, not a lock.
  */
-export default function PlaceOrderModal({ symbol, defaultReferencePrice, onClose, onPlaced }) {
-  const [orderKind, setOrderKind] = useState("intraday");
-  const [transactionType, setTransactionType] = useState("B");
-  const [orderType, setOrderType] = useState("MKT");
-  const [product, setProduct] = useState("I");
-  const [validity, setValidity] = useState("DAY");
-  const [price, setPrice] = useState(defaultReferencePrice ? String(defaultReferencePrice) : "");
-  const [triggerPrice, setTriggerPrice] = useState("");
-  const [quantity, setQuantity] = useState("");
+export default function PlaceOrderModal({ symbol, defaultReferencePrice, prefillOrder, onClose, onPlaced }) {
+  const [orderKind, setOrderKind] = useState(prefillOrder?.order_kind || "intraday");
+  const [transactionType, setTransactionType] = useState(prefillOrder?.transaction_type || "B");
+  const [orderType, setOrderType] = useState(prefillOrder?.order_type || "MKT");
+  const [product, setProduct] = useState(
+    prefillOrder?.product || (prefillOrder?.order_kind === "delivery" ? "C" : "I")
+  );
+  const [validity, setValidity] = useState(prefillOrder?.validity || "DAY");
+  const [price, setPrice] = useState(
+    prefillOrder?.price ? String(prefillOrder.price) : (defaultReferencePrice ? String(defaultReferencePrice) : "")
+  );
+  const [triggerPrice, setTriggerPrice] = useState(prefillOrder?.trigger_price ? String(prefillOrder.trigger_price) : "");
+  const [quantity, setQuantity] = useState(prefillOrder?.quantity ? String(prefillOrder.quantity) : "");
 
-  const [useStoplossCalc, setUseStoplossCalc] = useState(false);
+  const [useStoplossCalc, setUseStoplossCalc] = useState(!!prefillOrder?.stoploss_percentage);
   const [referencePrice, setReferencePrice] = useState(defaultReferencePrice ? String(defaultReferencePrice) : "");
-  const [stoplossPercentage, setStoplossPercentage] = useState("");
-  const [stoplossValue, setStoplossValue] = useState("");
+  const [stoplossPercentage, setStoplossPercentage] = useState(
+    prefillOrder?.stoploss_percentage ? String(prefillOrder.stoploss_percentage) : ""
+  );
+  const [stoplossValue, setStoplossValue] = useState(
+    prefillOrder?.stoploss_value ? String(prefillOrder.stoploss_value) : ""
+  );
 
   const [error, setError] = useState(null);
   const [submitting, setSubmitting] = useState(false);
 
   const needsPrice = orderType === "LMT" || orderType === "SL";
   const needsTrigger = orderType === "SL" || orderType === "SLM";
+  const productOptions = PRODUCTS_BY_KIND[orderKind];
+
+  function handleOrderKindChange(kind) {
+    setOrderKind(kind);
+    // Keep product in sync with kind automatically -- see the
+    // PRODUCTS_BY_KIND note above for why this matters.
+    setProduct(kind === "delivery" ? "C" : "I");
+  }
 
   const calculatedQuantity = useMemo(() => {
     const refPrice = parseFloat(referencePrice);
@@ -91,9 +118,11 @@ export default function PlaceOrderModal({ symbol, defaultReferencePrice, onClose
         stoploss_percentage: useStoplossCalc && stoplossPercentage ? parseFloat(stoplossPercentage) : null,
         stoploss_value: useStoplossCalc && stoplossValue ? parseFloat(stoplossValue) : null,
       });
+      showToast(`${transactionType === "B" ? "Buy" : "Sell"} order for ${symbol} placed successfully.`, "success");
       if (onPlaced) onPlaced();
       onClose();
     } catch (err) {
+      showToast(`Order for ${symbol} failed: ${err.message}`, "error");
       setError(err.message);
     } finally {
       setSubmitting(false);
@@ -103,14 +132,16 @@ export default function PlaceOrderModal({ symbol, defaultReferencePrice, onClose
   return (
     <div style={styles.overlay} onClick={onClose}>
       <form style={styles.modal} onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit}>
-        <h2 style={styles.title}>Place order — {symbol}</h2>
+        <h2 style={styles.title}>
+          {prefillOrder ? "Reorder — " : "Place order — "}{symbol}
+        </h2>
 
         <div style={styles.row}>
           <ToggleGroup value={transactionType} onChange={setTransactionType} options={[
             { value: "B", label: "Buy" },
             { value: "S", label: "Sell" },
           ]} />
-          <ToggleGroup value={orderKind} onChange={setOrderKind} options={[
+          <ToggleGroup value={orderKind} onChange={handleOrderKindChange} options={[
             { value: "intraday", label: "Intraday" },
             { value: "delivery", label: "Delivery" },
           ]} />
@@ -137,7 +168,7 @@ export default function PlaceOrderModal({ symbol, defaultReferencePrice, onClose
           <label style={styles.field}>
             <span style={styles.label}>Product</span>
             <select value={product} onChange={(e) => setProduct(e.target.value)}>
-              {PRODUCTS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+              {productOptions.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
             </select>
           </label>
         </div>

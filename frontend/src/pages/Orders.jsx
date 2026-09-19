@@ -1,10 +1,12 @@
 import { useState, useEffect } from "react";
 import { getOrders, cancelOrder } from "../api";
+import { showToast } from "../toast";
 import PlaceOrderModal from "../components/PlaceOrderModal";
 import ModifyOrderModal from "../components/ModifyOrderModal";
 import StockSearchInput from "../components/StockSearchInput";
 
 const TERMINAL_STATUSES = new Set(["Executed", "Cancelled", "Rejected"]);
+const REORDERABLE_STATUSES = new Set(["Cancelled", "Rejected"]);
 
 const STATUS_COLORS = {
   Pending: "var(--accent-loose)",
@@ -13,12 +15,26 @@ const STATUS_COLORS = {
   Rejected: "var(--negative)",
 };
 
+// Forces Indian time regardless of the viewer's own device timezone
+// setting -- the backend now stores placed_at as IST (see
+// models.py's now_ist_naive), but relying only on that plus a bare
+// toLocaleString would still show the wrong wall-clock time for
+// anyone whose browser isn't itself set to IST. Explicit timeZone
+// here is the belt-and-suspenders half of that fix.
+function formatIST(isoString) {
+  return new Date(isoString).toLocaleString("en-IN", {
+    hour12: false,
+    timeZone: "Asia/Kolkata",
+  });
+}
+
 export default function Orders({ onNavigateLive }) {
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [newOrderSymbol, setNewOrderSymbol] = useState(null);
   const [modifyingOrder, setModifyingOrder] = useState(null);
+  const [reorderTarget, setReorderTarget] = useState(null);
   const [cancellingId, setCancellingId] = useState(null);
 
   function reload() {
@@ -37,8 +53,10 @@ export default function Orders({ onNavigateLive }) {
     setError(null);
     try {
       await cancelOrder(order.id);
+      showToast(`Order for ${order.trading_symbol} cancelled.`, "success");
       reload();
     } catch (err) {
+      showToast(`Could not cancel order for ${order.trading_symbol}: ${err.message}`, "error");
       setError(err.message);
     } finally {
       setCancellingId(null);
@@ -79,7 +97,7 @@ export default function Orders({ onNavigateLive }) {
               <th style={styles.thRight}>Price</th>
               <th style={styles.thRight}>Trigger</th>
               <th style={styles.th}>Status</th>
-              <th style={styles.th}>Placed</th>
+              <th style={styles.th}>Placed (IST)</th>
               <th style={styles.th}></th>
             </tr>
           </thead>
@@ -102,15 +120,13 @@ export default function Orders({ onNavigateLive }) {
                     <div style={styles.brokerMsg} title={o.broker_message}>{o.broker_message}</div>
                   )}
                 </td>
-                <td style={styles.tdLeft} className="mono">
-                  {new Date(o.placed_at).toLocaleString("en-IN", { hour12: false })}
-                </td>
+                <td style={styles.tdLeft} className="mono">{formatIST(o.placed_at)}</td>
                 <td style={styles.tdRight}>
-                  {!TERMINAL_STATUSES.has(o.status) && (
-                    <div style={styles.actions}>
-                      {o.status === "Pending" && (
-                        <button style={styles.smallBtn} onClick={() => setModifyingOrder(o)}>Modify</button>
-                      )}
+                  <div style={styles.actions}>
+                    {!TERMINAL_STATUSES.has(o.status) && o.status === "Pending" && (
+                      <button style={styles.smallBtn} onClick={() => setModifyingOrder(o)}>Modify</button>
+                    )}
+                    {!TERMINAL_STATUSES.has(o.status) && (
                       <button
                         style={styles.smallBtnDanger}
                         onClick={() => handleCancel(o)}
@@ -118,8 +134,11 @@ export default function Orders({ onNavigateLive }) {
                       >
                         {cancellingId === o.id ? "..." : "Cancel"}
                       </button>
-                    </div>
-                  )}
+                    )}
+                    {REORDERABLE_STATUSES.has(o.status) && (
+                      <button style={styles.smallBtn} onClick={() => setReorderTarget(o)}>Reorder</button>
+                    )}
+                  </div>
                 </td>
               </tr>
             ))}
@@ -131,6 +150,15 @@ export default function Orders({ onNavigateLive }) {
         <PlaceOrderModal
           symbol={newOrderSymbol}
           onClose={() => setNewOrderSymbol(null)}
+          onPlaced={reload}
+        />
+      )}
+
+      {reorderTarget && (
+        <PlaceOrderModal
+          symbol={reorderTarget.trading_symbol}
+          prefillOrder={reorderTarget}
+          onClose={() => setReorderTarget(null)}
           onPlaced={reload}
         />
       )}
@@ -171,7 +199,7 @@ const styles = {
   tdLeft: { textAlign: "left", padding: "9px 10px", borderBottom: "1px solid var(--border)" },
   tdRight: { textAlign: "right", padding: "9px 10px", borderBottom: "1px solid var(--border)" },
   brokerMsg: { fontSize: 10, color: "var(--text-muted)", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-  actions: { display: "flex", gap: 6, justifyContent: "flex-end" },
+  actions: { display: "flex", gap: 6, justifyContent: "flex-end", flexWrap: "wrap" },
   smallBtn: { fontSize: 11, padding: "5px 9px" },
   smallBtnDanger: { fontSize: 11, padding: "5px 9px", color: "var(--negative)", borderColor: "rgba(255,92,92,0.4)" },
 };

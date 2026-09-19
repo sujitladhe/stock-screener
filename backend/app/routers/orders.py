@@ -12,10 +12,18 @@ Ventura's own Order Book only retains the current day), cancellation,
 and modification. record_and_place_order() is exported so
 routers/positions.py can place a stoploss exit order against a
 running position through the exact same path (same DB bookkeeping,
-same broker-credential rule) instead of duplicating this logic.
+same broker-credential rule) instead of duplicating this logic, and so
+a "reorder a cancelled order" flow on the frontend is just a normal
+POST /orders/place with the old order's values pre-filled -- not a
+special server-side path.
+
+All stored timestamps use now_ist_naive() (see models.py) instead of
+datetime.utcnow() -- a real bug had order placement times displayed
+~5.5 hours off Indian time because this file used UTC while the rest
+of the app follows IST discipline.
 """
 
-from datetime import date, datetime
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -24,7 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_session
-from app.models import UserSession, Order, Instrument
+from app.models import UserSession, Order, Instrument, now_ist_naive
 from app import ventura_trading
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -244,7 +252,7 @@ def _sync_todays_open_orders_with_broker(db: Session, session: UserSession) -> N
         if item.get("order_id") is not None
     }
 
-    now = datetime.utcnow()
+    now = now_ist_naive()
     for order in open_orders_today:
         broker_status = broker_status_by_order_no.get(str(order.broker_order_no))
         if broker_status and broker_status != order.status:
@@ -333,7 +341,7 @@ def cancel_order(
     is_success = broker_response.get("status") == "success"
 
     order.broker_message = broker_response.get("message", order.broker_message)
-    order.last_status_check_at = datetime.utcnow()
+    order.last_status_check_at = now_ist_naive()
     if is_success:
         order.status = "Cancelled"
     db.commit()
@@ -400,7 +408,7 @@ def modify_order(
 
     is_success = broker_response.get("status") == "success"
     order.broker_message = broker_response.get("message", order.broker_message)
-    order.last_status_check_at = datetime.utcnow()
+    order.last_status_check_at = now_ist_naive()
 
     if not is_success:
         db.commit()

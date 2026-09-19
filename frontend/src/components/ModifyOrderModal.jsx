@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { modifyOrder } from "../api";
+import { showToast } from "../toast";
 
 const ORDER_TYPES = ["MKT", "LMT", "SL", "SLM"];
 
@@ -40,9 +41,11 @@ export default function ModifyOrderModal({ order, onClose, onModified }) {
         trigger_price: needsTrigger ? parseFloat(triggerPrice) || 0 : 0,
         validity,
       });
+      showToast(`Order for ${order.trading_symbol} updated.`, "success");
       if (onModified) onModified();
       onClose();
     } catch (err) {
+      showToast(`Could not modify order for ${order.trading_symbol}: ${err.message}`, "error");
       setError(err.message);
     } finally {
       setSubmitting(false);
