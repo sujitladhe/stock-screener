@@ -19,7 +19,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.routers import auth, screener, watchlist, instruments, orders, alerts
+from app.routers import auth, screener, watchlist, instruments, orders, alerts, positions
 from app.ws_manager import manager
 from app import ws_client
 from app.config import settings
@@ -51,6 +51,7 @@ app.include_router(watchlist.router)
 app.include_router(instruments.router)
 app.include_router(orders.router)
 app.include_router(alerts.router)
+app.include_router(positions.router)
 
 # Serves the basic test UI at http://your-server:8000/static/index.html
 # — plain HTML/JS, no build step, used to prove the REST+WebSocket

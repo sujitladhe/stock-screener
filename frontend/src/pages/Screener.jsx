@@ -11,6 +11,7 @@ const STATUS_LABELS = {
 // navigating between pages instead of resetting.
 export default function Screener({
   clientId, onLoggedOut, onNavigateHistory, onNavigateWatchlist, onNavigateAlerts,
+  onNavigateOrders, onNavigatePositions,
   rows, connectionStatus, flashRowId, stockColors, onWatchlistChanged,
 }) {
   async function handleLogout() {
@@ -34,6 +35,8 @@ export default function Screener({
           <span style={styles.navLink} onClick={onNavigateHistory}>History</span>
           <span style={styles.navLink} onClick={onNavigateWatchlist}>Watchlist</span>
           <span style={styles.navLink} onClick={onNavigateAlerts}>Alerts</span>
+          <span style={styles.navLink} onClick={onNavigateOrders}>Orders</span>
+          <span style={styles.navLink} onClick={onNavigatePositions}>Positions</span>
         </nav>
         <div style={styles.headerRight}>
           <span style={styles.clientId}>{clientId}</span>

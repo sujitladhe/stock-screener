@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect, useRef } from "react";
 import { rowId } from "../hooks/useScreenerSocket";
 import AddToWatchlistModal from "./AddToWatchlistModal";
+import PlaceOrderModal from "./PlaceOrderModal";
 
 /**
  * Renders a searchable, sortable screener table.
@@ -14,12 +15,12 @@ import AddToWatchlistModal from "./AddToWatchlistModal";
  * The "Condition" column/badge from earlier versions is intentionally
  * removed per product decision - condition_matched is still present
  * in the row data but no longer rendered.
+ *
+ * % change is DERIVED (ltp vs prev_close), not a field on the row
+ * itself -- so sorting by it needs its own accessor rather than a
+ * plain row[sortKey] lookup (which would always be undefined for
+ * "pct_change" and silently no-op the sort).
  */
-
-// % change is DERIVED (ltp vs prev_close), not a field on the row
-// itself -- so sorting by it needs its own accessor rather than a
-// plain row[sortKey] lookup (which would always be undefined for
-// "pct_change" and silently no-op the sort).
 function getSortValue(row, key) {
   if (key === "pct_change") {
     if (row.prev_close === null || row.prev_close === undefined || row.prev_close === 0) {
@@ -35,6 +36,7 @@ export default function ScreenerTable({ rows, flashRowId, emptyMessage, stockCol
   const [sortKey, setSortKey] = useState("last_triggered_at");
   const [sortDesc, setSortDesc] = useState(true);
   const [watchlistModalSymbol, setWatchlistModalSymbol] = useState(null);
+  const [orderModalRow, setOrderModalRow] = useState(null);
 
   const filtered = useMemo(() => {
     const term = search.toLowerCase();
@@ -99,6 +101,7 @@ export default function ScreenerTable({ rows, flashRowId, emptyMessage, stockCol
               isFlashing={flashRowId === rowId(row)}
               color={stockColors[row.trading_symbol]}
               onAddToWatchlist={() => setWatchlistModalSymbol(row.trading_symbol)}
+              onPlaceOrder={() => setOrderModalRow(row)}
             />
           ))}
           {filtered.length === 0 && (
@@ -116,6 +119,14 @@ export default function ScreenerTable({ rows, flashRowId, emptyMessage, stockCol
           symbol={watchlistModalSymbol}
           onClose={() => setWatchlistModalSymbol(null)}
           onAdded={onWatchlistChanged}
+        />
+      )}
+
+      {orderModalRow && (
+        <PlaceOrderModal
+          symbol={orderModalRow.trading_symbol}
+          defaultReferencePrice={orderModalRow.ltp}
+          onClose={() => setOrderModalRow(null)}
         />
       )}
     </div>
@@ -157,6 +168,15 @@ function BookmarkIcon({ filled }) {
   );
 }
 
+function OrderIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="12" y1="19" x2="12" y2="5" />
+      <polyline points="5 12 12 5 19 12" />
+    </svg>
+  );
+}
+
 /**
  * % change formatting per an explicit product decision:
  *   - positive: green, no "+" prefix
@@ -177,7 +197,7 @@ function PctChange({ ltp, prevClose }) {
   );
 }
 
-function Row({ row, isFlashing, color, onAddToWatchlist }) {
+function Row({ row, isFlashing, color, onAddToWatchlist, onPlaceOrder }) {
   const [flashing, setFlashing] = useState(false);
   const timerRef = useRef(null);
 
@@ -217,6 +237,15 @@ function Row({ row, isFlashing, color, onAddToWatchlist }) {
             aria-label={`Add ${row.trading_symbol} to watchlist`}
           >
             <BookmarkIcon filled={!!color} />
+          </button>
+          <button
+            className="chart-icon-btn"
+            style={styles.chartIconBtn}
+            onClick={onPlaceOrder}
+            title={`Place an order for ${row.trading_symbol}`}
+            aria-label={`Place an order for ${row.trading_symbol}`}
+          >
+            <OrderIcon />
           </button>
         </span>
       </td>

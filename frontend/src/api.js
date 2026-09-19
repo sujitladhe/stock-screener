@@ -169,3 +169,55 @@ export async function clearAlertHistory() {
   });
   return handleJson(res, "Failed to clear alert history");
 }
+
+// --- Orders ---
+
+export async function getOrders() {
+  const res = await fetch(`${API_BASE}/orders`, { credentials: "include" });
+  return handleJson(res, "Failed to load orders");
+}
+
+export async function placeOrder(payload) {
+  const res = await fetch(`${API_BASE}/orders/place`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(payload),
+  });
+  return handleJson(res, "Failed to place order");
+}
+
+export async function cancelOrder(orderId) {
+  const res = await fetch(`${API_BASE}/orders/${orderId}/cancel`, {
+    method: "POST",
+    credentials: "include",
+  });
+  return handleJson(res, "Failed to cancel order");
+}
+
+export async function modifyOrder(orderId, payload) {
+  const res = await fetch(`${API_BASE}/orders/${orderId}/modify`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(payload),
+  });
+  return handleJson(res, "Failed to modify order");
+}
+
+// --- Positions ---
+
+export async function getPositions() {
+  const res = await fetch(`${API_BASE}/positions`, { credentials: "include" });
+  return handleJson(res, "Failed to load positions");
+}
+
+export async function placeStoplossOrder(payload) {
+  const res = await fetch(`${API_BASE}/positions/stoploss`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(payload),
+  });
+  return handleJson(res, "Failed to place stoploss order");
+}

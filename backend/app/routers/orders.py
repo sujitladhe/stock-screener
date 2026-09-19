@@ -6,12 +6,13 @@ LOGGED-IN USER's own app_key/client_id/auth_token -- orders are placed
 on that specific person's Ventura account, never the shared service
 account used elsewhere in this app for instruments/market data.
 
-Now covers: placement, listing (our own permanent record, synced
-against the broker's live order book for today's still-open orders,
-since Ventura's own Order Book only retains the current day per
-ventura_trading.get_order_book's docstring), and cancellation.
-Positions/live P&L are deliberately NOT in this file -- that's the
-next piece to build on top of this.
+Covers: placement, listing (our own permanent record, synced against
+the broker's live order book for today's still-open orders, since
+Ventura's own Order Book only retains the current day), cancellation,
+and modification. record_and_place_order() is exported so
+routers/positions.py can place a stoploss exit order against a
+running position through the exact same path (same DB bookkeeping,
+same broker-credential rule) instead of duplicating this logic.
 """
 
 from datetime import date, datetime
@@ -49,6 +50,19 @@ class PlaceOrderRequest(BaseModel):
     stoploss_value: Optional[float] = None
 
 
+class ModifyOrderRequest(BaseModel):
+    # All optional -- only fields the user actually changed need to be
+    # sent. Anything omitted is filled in from the order's current
+    # stored values before calling the broker (see modify_order()
+    # below), since Ventura's modify call is assumed to need the full
+    # order resent, not just a diff.
+    quantity: Optional[int] = None
+    order_type: Optional[str] = None
+    price: Optional[float] = None
+    trigger_price: Optional[float] = None
+    validity: Optional[str] = None
+
+
 def _serialize_order(o: Order) -> dict:
     return {
         "id": o.id,
@@ -69,6 +83,122 @@ def _serialize_order(o: Order) -> dict:
         "broker_message": o.broker_message,
         "placed_at": o.placed_at.isoformat(),
         "last_status_check_at": o.last_status_check_at.isoformat() if o.last_status_check_at else None,
+    }
+
+
+def record_and_place_order(
+    db: Session,
+    session: UserSession,
+    *,
+    trading_symbol: str,
+    order_kind: str,
+    transaction_type: str,
+    order_type: str,
+    quantity: int,
+    product: str,
+    price: float = 0.0,
+    trigger_price: float = 0.0,
+    validity: str = "DAY",
+    stoploss_percentage: Optional[float] = None,
+    stoploss_value: Optional[float] = None,
+) -> dict:
+    """
+    Shared "look up instrument, call broker, persist an Order row"
+    logic -- used by POST /orders/place below AND by
+    routers/positions.py's stoploss-exit endpoint, so a stoploss order
+    placed against a running position gets EXACTLY the same handling
+    (same audit trail, same rejection bookkeeping) as any other order,
+    rather than a second, drifting implementation.
+
+    Raises HTTPException on any validation or broker-level failure, so
+    callers can just let it propagate.
+    """
+    if order_kind not in ("delivery", "intraday"):
+        raise HTTPException(status_code=400, detail="order_kind must be 'delivery' or 'intraday'")
+    if transaction_type not in ("B", "S"):
+        raise HTTPException(status_code=400, detail="transaction_type must be 'B' or 'S'")
+    if quantity <= 0:
+        raise HTTPException(status_code=400, detail="quantity must be positive")
+
+    instrument = (
+        db.query(Instrument)
+        .filter_by(trading_symbol=trading_symbol, exchange="NSE", instrument_type="EQ", is_active=True)
+        .first()
+    )
+    if not instrument:
+        raise HTTPException(status_code=404, detail=f"Unknown or inactive symbol: {trading_symbol}")
+
+    try:
+        broker_response = ventura_trading.place_order(
+            app_key=session.app_key,
+            client_id=session.client_id,
+            auth_token=session.ventura_auth_token,
+            order_kind=order_kind,
+            instrument_id=int(instrument.exchange_token),
+            exchange="NSE",
+            segment="E",
+            transaction_type=transaction_type,
+            order_type=order_type,
+            quantity=quantity,
+            product=product,
+            price=price,
+            trigger_price=trigger_price,
+            validity=validity,
+        )
+    except RuntimeError as e:
+        order_row = Order(
+            client_id=session.client_id,
+            instrument_id=instrument.id,
+            trading_symbol=instrument.trading_symbol,
+            order_kind=order_kind,
+            transaction_type=transaction_type,
+            order_type=order_type,
+            product=product,
+            quantity=quantity,
+            price=price,
+            trigger_price=trigger_price,
+            validity=validity,
+            stoploss_percentage=stoploss_percentage,
+            stoploss_value=stoploss_value,
+            status="Rejected",
+            broker_message=str(e),
+        )
+        db.add(order_row)
+        db.commit()
+        raise HTTPException(status_code=502, detail=f"Could not reach broker: {e}")
+
+    is_success = broker_response.get("status") == "success"
+
+    order_row = Order(
+        client_id=session.client_id,
+        instrument_id=instrument.id,
+        trading_symbol=instrument.trading_symbol,
+        order_kind=order_kind,
+        transaction_type=transaction_type,
+        order_type=order_type,
+        product=product,
+        quantity=quantity,
+        price=price,
+        trigger_price=trigger_price,
+        validity=validity,
+        stoploss_percentage=stoploss_percentage,
+        stoploss_value=stoploss_value,
+        broker_order_no=broker_response.get("order_no"),
+        status="Pending" if is_success else "Rejected",
+        broker_message=broker_response.get("message"),
+    )
+    db.add(order_row)
+    db.commit()
+    db.refresh(order_row)
+
+    if not is_success:
+        raise HTTPException(status_code=400, detail=broker_response.get("message", "Order rejected by broker."))
+
+    return {
+        "id": order_row.id,
+        "broker_order_no": order_row.broker_order_no,
+        "status": order_row.status,
+        "message": order_row.broker_message,
     }
 
 
@@ -153,93 +283,20 @@ def place_order(
     db: Session = Depends(get_db),
     session: UserSession = Depends(get_current_session),
 ):
-    if req.order_kind not in ("delivery", "intraday"):
-        raise HTTPException(status_code=400, detail="order_kind must be 'delivery' or 'intraday'")
-    if req.transaction_type not in ("B", "S"):
-        raise HTTPException(status_code=400, detail="transaction_type must be 'B' or 'S'")
-    if req.quantity <= 0:
-        raise HTTPException(status_code=400, detail="quantity must be positive")
-
-    instrument = (
-        db.query(Instrument)
-        .filter_by(trading_symbol=req.trading_symbol, exchange="NSE", instrument_type="EQ", is_active=True)
-        .first()
-    )
-    if not instrument:
-        raise HTTPException(status_code=404, detail=f"Unknown or inactive symbol: {req.trading_symbol}")
-
-    try:
-        broker_response = ventura_trading.place_order(
-            app_key=session.app_key,
-            client_id=session.client_id,
-            auth_token=session.ventura_auth_token,
-            order_kind=req.order_kind,
-            instrument_id=int(instrument.exchange_token),
-            exchange="NSE",
-            segment="E",
-            transaction_type=req.transaction_type,
-            order_type=req.order_type,
-            quantity=req.quantity,
-            product=req.product,
-            price=req.price,
-            trigger_price=req.trigger_price,
-            validity=req.validity,
-        )
-    except RuntimeError as e:
-        order_row = Order(
-            client_id=session.client_id,
-            instrument_id=instrument.id,
-            trading_symbol=instrument.trading_symbol,
-            order_kind=req.order_kind,
-            transaction_type=req.transaction_type,
-            order_type=req.order_type,
-            product=req.product,
-            quantity=req.quantity,
-            price=req.price,
-            trigger_price=req.trigger_price,
-            validity=req.validity,
-            stoploss_percentage=req.stoploss_percentage,
-            stoploss_value=req.stoploss_value,
-            status="Rejected",
-            broker_message=str(e),
-        )
-        db.add(order_row)
-        db.commit()
-        raise HTTPException(status_code=502, detail=f"Could not reach broker: {e}")
-
-    is_success = broker_response.get("status") == "success"
-
-    order_row = Order(
-        client_id=session.client_id,
-        instrument_id=instrument.id,
-        trading_symbol=instrument.trading_symbol,
+    return record_and_place_order(
+        db, session,
+        trading_symbol=req.trading_symbol,
         order_kind=req.order_kind,
         transaction_type=req.transaction_type,
         order_type=req.order_type,
-        product=req.product,
         quantity=req.quantity,
+        product=req.product,
         price=req.price,
         trigger_price=req.trigger_price,
         validity=req.validity,
         stoploss_percentage=req.stoploss_percentage,
         stoploss_value=req.stoploss_value,
-        broker_order_no=broker_response.get("order_no"),
-        status="Pending" if is_success else "Rejected",
-        broker_message=broker_response.get("message"),
     )
-    db.add(order_row)
-    db.commit()
-    db.refresh(order_row)
-
-    if not is_success:
-        raise HTTPException(status_code=400, detail=broker_response.get("message", "Order rejected by broker."))
-
-    return {
-        "id": order_row.id,
-        "broker_order_no": order_row.broker_order_no,
-        "status": order_row.status,
-        "message": order_row.broker_message,
-    }
 
 
 @router.post("/{order_id}/cancel")
@@ -289,3 +346,72 @@ def cancel_order(
         "status": order.status,
         "message": order.broker_message,
     }
+
+
+@router.patch("/{order_id}/modify")
+def modify_order(
+    order_id: int,
+    req: ModifyOrderRequest,
+    db: Session = Depends(get_db),
+    session: UserSession = Depends(get_current_session),
+):
+    """
+    Modifies a still-pending order, via Ventura's confirmed
+    trade/v1/modify endpoint (see ventura_trading.modify_order).
+
+    Only fields present in the request are changed; everything else is
+    resent as-is from the order's current stored values, since
+    Ventura's modify calls (like most brokers') are assumed to expect
+    the full order, not a partial diff.
+    """
+    order = db.query(Order).filter_by(id=order_id, client_id=session.client_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+
+    if order.status != "Pending":
+        raise HTTPException(status_code=400, detail=f"Only a Pending order can be modified (this one is {order.status}).")
+
+    if not order.broker_order_no:
+        raise HTTPException(status_code=400, detail="Order has no broker order number — nothing to modify at the broker.")
+
+    new_quantity = req.quantity if req.quantity is not None else order.quantity
+    new_order_type = req.order_type if req.order_type is not None else order.order_type
+    new_price = req.price if req.price is not None else float(order.price or 0)
+    new_trigger_price = req.trigger_price if req.trigger_price is not None else float(order.trigger_price or 0)
+    new_validity = req.validity if req.validity is not None else order.validity
+
+    if new_quantity <= 0:
+        raise HTTPException(status_code=400, detail="quantity must be positive")
+
+    try:
+        broker_response = ventura_trading.modify_order(
+            app_key=session.app_key,
+            client_id=session.client_id,
+            auth_token=session.ventura_auth_token,
+            order_no=order.broker_order_no,
+            quantity=new_quantity,
+            order_type=new_order_type,
+            price=new_price,
+            trigger_price=new_trigger_price,
+            validity=new_validity,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach broker: {e}")
+
+    is_success = broker_response.get("status") == "success"
+    order.broker_message = broker_response.get("message", order.broker_message)
+    order.last_status_check_at = datetime.utcnow()
+
+    if not is_success:
+        db.commit()
+        raise HTTPException(status_code=400, detail=broker_response.get("message", "Broker declined to modify this order."))
+
+    order.quantity = new_quantity
+    order.order_type = new_order_type
+    order.price = new_price
+    order.trigger_price = new_trigger_price
+    order.validity = new_validity
+    db.commit()
+    db.refresh(order)
+
+    return _serialize_order(order)

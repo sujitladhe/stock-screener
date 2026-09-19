@@ -1,6 +1,6 @@
 """
-ventura_trading.py — order placement, cancellation, order book, and
-positions, via Ventura's EaseAPI.
+ventura_trading.py — order placement, cancellation, modification,
+order book, and positions, via Ventura's EaseAPI.
 
 CRITICAL: every function here takes an `auth_token` (and `client_id`,
 `app_key`) parameter explicitly, and the CALLER is responsible for
@@ -12,9 +12,15 @@ instruments/live-feed data, which is shared infrastructure -- orders
 are real money movement on one specific person's account, and using
 the wrong credentials here would be a serious bug, not a cosmetic one.
 
-Endpoint details below are taken directly from Ventura's own EaseAPI
-docs (Place Order, Cancel Order, Order Book, Positions pages) -- not
-guessed.
+Endpoint details for EVERY function in this file, including
+modify_order(), are now confirmed against Ventura's own published
+EaseAPI docs (https://easeapi.venturasecurities.com/docs/) -- not
+guessed. modify_order() was originally written before that doc page
+was checked; verifying it against the real docs caught one real bug
+(the payload was using `disclosed_quantity` where Ventura's API
+actually expects `disc_quantity` -- now fixed below). The
+MODIFY_ORDER_URL itself turned out to be correct as originally
+inferred from the other trade/v1/* endpoints' naming convention.
 """
 
 import requests
@@ -24,6 +30,8 @@ INTRADAY_ORDER_URL = "https://easeapi.venturasecurities.com/trade/v1/intraday/re
 CANCEL_ORDER_URL = "https://easeapi.venturasecurities.com/trade/v1/cancel"
 ORDER_BOOK_URL = "https://easeapi.venturasecurities.com/trade/v1/orders"
 POSITIONS_URL = "https://easeapi.venturasecurities.com/portfolio/v1/positions"
+
+MODIFY_ORDER_URL = "https://easeapi.venturasecurities.com/trade/v1/modify"
 
 
 def _headers(app_key: str, client_id: str, auth_token: str, json_body: bool = True) -> dict:
@@ -109,6 +117,49 @@ def cancel_order(app_key: str, client_id: str, auth_token: str, order_no: str) -
     return response.json()
 
 
+def modify_order(
+    app_key: str,
+    client_id: str,
+    auth_token: str,
+    order_no: str,
+    quantity: int,
+    order_type: str,
+    price: float = 0.0,
+    trigger_price: float = 0.0,
+    validity: str = "DAY",
+    disc_quantity: int = 0,
+) -> dict:
+    """
+    Modifies a still-open (Pending) order. Per Ventura's docs, this
+    resends the full order (not just changed fields) -- the router
+    calling this fills in the order's CURRENT stored values for
+    anything the user didn't change, rather than sending partial data.
+
+    Returns {client_id, order_no, message, status} per Ventura's docs
+    -- status is "success" or "error", same convention as place_order
+    and cancel_order.
+    """
+    payload = {
+        "order_no": order_no,
+        "quantity": quantity,
+        "order_type": order_type,
+        "price": price,
+        "trigger_price": trigger_price,
+        "validity": validity,
+        "disc_quantity": disc_quantity,
+    }
+
+    response = requests.post(
+        MODIFY_ORDER_URL,
+        headers=_headers(app_key, client_id, auth_token),
+        json=payload,
+        timeout=15,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Modify order request failed (HTTP {response.status_code}): {response.text}")
+    return response.json()
+
+
 def get_order_book(app_key: str, client_id: str, auth_token: str) -> list:
     """
     Returns today's orders only -- Ventura's own docs state the order
@@ -131,6 +182,17 @@ def get_positions(app_key: str, client_id: str, auth_token: str) -> dict:
     broker itself. We deliberately do NOT recompute P&L ourselves from
     live ticks; the broker's own figure is authoritative and avoids an
     entire class of potential bugs in a from-scratch P&L engine.
+
+    Confirmed field names per position, per Ventura's docs: `symbol`,
+    `token`, `last_traded_price`, `exchange`, `segment`, `action`
+    ("B"/"S" per the docs' own parameter table -- note their sample
+    response instead shows literal "BUY"/"SELL", an inconsistency in
+    Ventura's own docs, so the frontend doesn't rely on this field's
+    exact string), `product_type`, `average_traded_price`,
+    `total_quantity` (SIGNED -- negative means a short/sell position,
+    positive means long/buy), `profit_loss`, `lot_size`, plus
+    F&O-only fields (instrument_type, expiry_date, expiry_type,
+    option_type, strike_price) that are empty strings for equity.
     """
     response = requests.get(POSITIONS_URL, headers=_headers(app_key, client_id, auth_token, json_body=False), timeout=15)
     if response.status_code != 200:

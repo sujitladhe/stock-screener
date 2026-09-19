@@ -4,6 +4,8 @@ import Screener from "./pages/Screener";
 import History from "./pages/History";
 import Watchlist from "./pages/Watchlist";
 import Alerts from "./pages/Alerts";
+import Orders from "./pages/Orders";
+import Positions from "./pages/Positions";
 import { getCurrentSession } from "./api";
 import { useScreenerSocket } from "./hooks/useScreenerSocket";
 import { useStockColors } from "./hooks/useStockColors";
@@ -12,7 +14,7 @@ import { playAlertSound } from "./soundAlert";
 
 export default function App() {
   const [clientId, setClientId] = useState(undefined); // undefined = still checking, null = logged out
-  const [view, setView] = useState("screener"); // "screener" | "history" | "watchlist" | "alerts"
+  const [view, setView] = useState("screener"); // "screener" | "history" | "watchlist" | "alerts" | "orders" | "positions"
   // Incremented every time a user_alert arrives — Alerts.jsx watches
   // this to know when to refetch history, even if it's not the
   // currently visible page when the alert fires.
@@ -72,6 +74,14 @@ export default function App() {
     );
   }
 
+  if (view === "orders") {
+    return <Orders onNavigateLive={() => setView("screener")} />;
+  }
+
+  if (view === "positions") {
+    return <Positions onNavigateLive={() => setView("screener")} />;
+  }
+
   return (
     <Screener
       clientId={clientId}
@@ -79,6 +89,8 @@ export default function App() {
       onNavigateHistory={() => setView("history")}
       onNavigateWatchlist={() => setView("watchlist")}
       onNavigateAlerts={() => setView("alerts")}
+      onNavigateOrders={() => setView("orders")}
+      onNavigatePositions={() => setView("positions")}
       rows={rows}
       connectionStatus={connectionStatus}
       flashRowId={flashRowId}
