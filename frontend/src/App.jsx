@@ -6,30 +6,50 @@ import Watchlist from "./pages/Watchlist";
 import Alerts from "./pages/Alerts";
 import Orders from "./pages/Orders";
 import Positions from "./pages/Positions";
+import Settings from "./pages/Settings";
 import ToastStack from "./components/ToastStack";
-import { getCurrentSession } from "./api";
+import { getCurrentSession, logout } from "./api";
 import { useScreenerSocket } from "./hooks/useScreenerSocket";
 import { useStockColors } from "./hooks/useStockColors";
 import { usePositions } from "./hooks/usePositions";
+import { useSettings } from "./hooks/useSettings";
+import { useDropdownMenu } from "./hooks/useDropdownMenu";
 import { showAlertNotification, showBrowserNotification } from "./browserNotify";
 import { playAlertSound } from "./soundAlert";
 import { showToast } from "./toast";
+import { NAV_ICONS, SunIcon, MoonIcon } from "./icons";
+
+const NAV = [
+  ["live", "Live"],
+  ["orders", "Orders"],
+  ["positions", "Positions"],
+  ["watchlists", "Watchlists"],
+  ["alerts", "Alerts"],
+  ["history", "History"],
+  ["settings", "Settings"],
+];
+
+function BrandMark() {
+  return (
+    <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
+      <rect width="28" height="28" rx="8" fill="var(--text)" />
+      <rect x="6" y="15" width="3.6" height="7" rx="1.2" fill="var(--ground)" />
+      <rect x="12.2" y="11" width="3.6" height="11" rx="1.2" fill="var(--ground)" />
+      <rect x="18.4" y="6" width="3.6" height="16" rx="1.2" fill="var(--mari)" />
+    </svg>
+  );
+}
 
 export default function App() {
   const [clientId, setClientId] = useState(undefined); // undefined = still checking, null = logged out
-  const [view, setView] = useState("screener"); // "screener" | "history" | "watchlist" | "alerts" | "orders" | "positions"
-  // Incremented every time a user_alert arrives — Alerts.jsx watches
-  // this to know when to refetch history, even if it's not the
-  // currently visible page when the alert fires.
+  const [view, setView] = useState("live");
   const [alertRefreshSignal, setAlertRefreshSignal] = useState(0);
-  // Same idea for auto trade (requirement 10): incremented whenever an
-  // auto order fires (placed OR failed), so the Orders page reloads its
-  // list live instead of only on manual refresh.
   const [ordersRefreshSignal, setOrdersRefreshSignal] = useState(0);
-  // usePositions is called further down (it needs clientId), but the
-  // auto-trade handler above it needs to trigger a positions refetch —
-  // a ref bridges the two without reordering the hooks.
+  const [autoActiveCount, setAutoActiveCount] = useState(0);
   const refetchPositionsRef = useRef(null);
+
+  const { settings, update: updateSettings, toggleTheme } = useSettings();
+  const { open: openAccountMenu, menu: accountMenu } = useDropdownMenu();
 
   useEffect(() => {
     getCurrentSession()
@@ -37,28 +57,17 @@ export default function App() {
       .catch(() => setClientId(null));
   }, []);
 
-  // Fires regardless of which page is currently showing — a personal
-  // alert should notify the user even if they're looking at History
-  // or Watchlist, not just the Live screener page.
   const handleUserAlert = useCallback((alert) => {
     showAlertNotification(alert);
-    if (alert.sound_enabled) {
-      playAlertSound();
-    }
+    if (alert.sound_enabled) playAlertSound();
     setAlertRefreshSignal((n) => n + 1);
   }, []);
 
-  // An AUTO order fired (requirement 10e): tell the user whether it was
-  // placed or failed, on whichever page they're looking at. Note
-  // "success" means the broker ACCEPTED the order — whether it then
-  // executes shows up in the Orders page status and, once filled, as a
-  // position (which we refetch below so it appears with live P&L).
   const handleAutoTrade = useCallback((msg) => {
     const side = msg.transaction_type === "B" ? "Buy" : "Sell";
     const ok = msg.outcome === "success";
-
     const text = ok
-      ? `Auto ${side} order placed: ${msg.quantity} x ${msg.trading_symbol}` +
+      ? `Auto ${side} order placed: ${msg.quantity} × ${msg.trading_symbol}` +
         (msg.broker_order_no ? ` (order #${msg.broker_order_no})` : "") +
         (msg.trigger_details ? `. ${msg.trigger_details}` : "")
       : `Auto order for ${msg.trading_symbol} FAILED: ${msg.message || "unknown error"}`;
@@ -70,33 +79,27 @@ export default function App() {
       tag: `auto-trade-${msg.order_id}`,
     });
     playAlertSound();
-
     setOrdersRefreshSignal((n) => n + 1);
 
     if (ok) {
-      // A market order usually fills within a second or two; refetch
-      // now and again shortly after so the new position shows up
-      // without waiting for the next 10-second poll.
       const refetch = () => refetchPositionsRef.current && refetchPositionsRef.current();
       refetch();
       setTimeout(refetch, 3000);
     }
   }, []);
 
-  // Owned here (not inside individual pages) so the WebSocket
-  // connection survives navigating between pages instead of
-  // disconnecting/reconnecting every time.
   const { rows, connectionStatus, flashRowId } = useScreenerSocket(!!clientId, handleUserAlert, handleAutoTrade);
   const { stockColors, refetchStockColors } = useStockColors(!!clientId);
-  // Lifted here (not inside Positions.jsx) so the Screener page's
-  // Open P&L widget and the Positions page itself share the SAME
-  // polling interval and data, instead of each page opening its own
-  // independent poll against the broker.
   const { openPositions, closedPositions, totalOpenPnl, loading: positionsLoading, error: positionsError, refetchPositions } = usePositions(!!clientId);
   refetchPositionsRef.current = refetchPositions;
 
+  async function handleLogout() {
+    await logout();
+    setClientId(null);
+  }
+
   if (clientId === undefined) {
-    return <div style={{ padding: 24, color: "var(--text-muted)" }}>Loading...</div>;
+    return <div style={{ padding: 24, color: "var(--muted)" }}>Loading...</div>;
   }
 
   if (!clientId) {
@@ -108,36 +111,23 @@ export default function App() {
     );
   }
 
-  let page;
+  const badges = {
+    orders: autoActiveCount,
+    positions: openPositions.length,
+  };
 
+  let page;
   if (view === "history") {
-    page = (
-      <History
-        onNavigateLive={() => setView("screener")}
-        stockColors={stockColors}
-        onWatchlistChanged={refetchStockColors}
-      />
-    );
-  } else if (view === "watchlist") {
-    page = <Watchlist onNavigateLive={() => setView("screener")} onChanged={refetchStockColors} />;
+    page = <History stockColors={stockColors} onWatchlistChanged={refetchStockColors} onNavigateWatchlists={() => setView("watchlists")} settings={settings} />;
+  } else if (view === "watchlists") {
+    page = <Watchlist onChanged={refetchStockColors} settings={settings} />;
   } else if (view === "alerts") {
-    page = (
-      <Alerts
-        onNavigateLive={() => setView("screener")}
-        refreshSignal={alertRefreshSignal}
-      />
-    );
+    page = <Alerts refreshSignal={alertRefreshSignal} />;
   } else if (view === "orders") {
-    page = (
-      <Orders
-        onNavigateLive={() => setView("screener")}
-        refreshSignal={ordersRefreshSignal}
-      />
-    );
+    page = <Orders refreshSignal={ordersRefreshSignal} settings={settings} onAutoActiveCountChange={setAutoActiveCount} />;
   } else if (view === "positions") {
     page = (
       <Positions
-        onNavigateLive={() => setView("screener")}
         openPositions={openPositions}
         closedPositions={closedPositions}
         totalOpenPnl={totalOpenPnl}
@@ -146,31 +136,82 @@ export default function App() {
         refetchPositions={refetchPositions}
       />
     );
+  } else if (view === "settings") {
+    page = <Settings settings={settings} onChange={updateSettings} />;
   } else {
     page = (
       <Screener
-        clientId={clientId}
-        onLoggedOut={() => setClientId(null)}
-        onNavigateHistory={() => setView("history")}
-        onNavigateWatchlist={() => setView("watchlist")}
-        onNavigateAlerts={() => setView("alerts")}
-        onNavigateOrders={() => setView("orders")}
-        onNavigatePositions={() => setView("positions")}
         rows={rows}
-        connectionStatus={connectionStatus}
         flashRowId={flashRowId}
         stockColors={stockColors}
         onWatchlistChanged={refetchStockColors}
-        totalOpenPnl={totalOpenPnl}
-        openPositionsCount={openPositions.length}
+        onNavigateWatchlists={() => setView("watchlists")}
+        settings={settings}
       />
     );
   }
 
+  const dark = settings.theme === "dark" || (settings.theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  const pageTitle = NAV.find(([k]) => k === view)?.[1] || "Live";
+
   return (
-    <>
-      {page}
+    <div className="app">
+      <aside className="rail" aria-label="Main">
+        <button type="button" className="brand" onClick={() => setView("live")} aria-label="Screener home">
+          <BrandMark />Screener
+        </button>
+        <nav className="nav">
+          {NAV.map(([key, label]) => {
+            const Icon = NAV_ICONS[key];
+            const badge = badges[key];
+            return (
+              <button
+                type="button"
+                key={key}
+                className={`navlink${view === key ? " active" : ""}`}
+                aria-current={view === key ? "page" : undefined}
+                onClick={() => setView(key)}
+              >
+                <Icon size={20} />
+                <span>{label}</span>
+                {!!badge && <span className="count" title={key === "orders" ? "Auto orders waiting to trigger" : "Open positions"}>{badge}</span>}
+              </button>
+            );
+          })}
+        </nav>
+      </aside>
+
+      <div className="main">
+        <header className="topbar">
+          <h1>{pageTitle}</h1>
+          <span className="chip" title="Live data connection">
+            <i className={`dot${connectionStatus === "connected" ? " on" : ""}`} /><span className="lbl-hide">{connectionStatus === "connected" ? "Connected" : connectionStatus === "reconnecting" ? "Reconnecting" : "Connecting"}</span>
+          </span>
+          {openPositions.length > 0 && (
+            <button type="button" className="chip" onClick={() => setView("positions")} title="Open positions profit and loss">
+              <span className="muted lbl-hide">Open P&amp;L</span>
+              <b className="num" style={{ color: totalOpenPnl >= 0 ? "var(--up)" : "var(--down)" }}>
+                {totalOpenPnl >= 0 ? "+" : "-"}₹{Math.abs(Math.round(totalOpenPnl)).toLocaleString("en-IN")}
+              </b>
+            </button>
+          )}
+          <button type="button" className="icon-btn bordered" onClick={toggleTheme} aria-label={dark ? "Switch to light theme" : "Switch to dark theme"}>
+            {dark ? <SunIcon size={17} /> : <MoonIcon size={17} />}
+          </button>
+          <button
+            type="button"
+            className="chip"
+            aria-haspopup="menu"
+            onClick={(e) => openAccountMenu(e, [{ label: "Sign out", onClick: handleLogout }])}
+          >
+            {clientId}
+          </button>
+        </header>
+        <main className="content">{page}</main>
+      </div>
+
+      {accountMenu}
       <ToastStack />
-    </>
+    </div>
   );
 }

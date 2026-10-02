@@ -1,39 +1,34 @@
 import { useState, useEffect } from "react";
 import {
-  getAlerts, createAlert, toggleAlert, deleteAlert,
+  getAlerts, createAlert, deleteAlert,
   getAlertHistory, clearAlertHistory,
 } from "../api";
 import { getNotificationPermission, requestNotificationPermission } from "../browserNotify";
 import StockSearchInput from "../components/StockSearchInput";
+import { useConfirm } from "../hooks/useConfirm";
+import { showToast } from "../toast";
 
-// 1 Crore = 1,00,00,000 = 10,000,000. Per an explicit product decision,
-// the VALUE (Volume x Price) condition's threshold is entered in
-// crores for convenience (e.g. "6" means 6 Cr) — raw rupee amounts for
-// this metric are unwieldy to type (6 Cr = 60000000). The PRICE
-// condition stays in plain rupees, since no NSE stock trades at
-// "crores per share" — only Value gets this scaling.
+const METRIC_LABELS = { price: "Price", value: "Value (volume × price)" };
+const DIRECTION_LABELS = { above: "rises to or above", below: "falls to or below" };
 const ONE_CRORE = 10000000;
 
-const METRIC_LABELS = { price: "Price", value: "Value (Vol x Price)" };
-const OPERATOR_LABELS = { above: ">= (crosses above)", below: "<= (crosses below)" };
-
-function scaleThresholdForSubmit(metric, rawInput) {
+function formatAmount(metric, value) {
+  return metric === "value" ? `₹${value} Cr` : `₹${value}`;
+}
+function scaleForSubmit(metric, rawInput) {
   const num = parseFloat(rawInput);
   return metric === "value" ? num * ONE_CRORE : num;
 }
-
-function formatThresholdForDisplay(metric, storedValue) {
-  if (metric === "value") {
-    return `${(storedValue / ONE_CRORE).toFixed(2)} Cr`;
-  }
-  return storedValue;
+function displayThreshold(metric, storedValue) {
+  return metric === "value" ? `${(storedValue / ONE_CRORE).toFixed(2)} Cr` : storedValue;
 }
 
-export default function Alerts({ onNavigateLive, refreshSignal }) {
+export default function Alerts({ refreshSignal }) {
   const [alerts, setAlerts] = useState([]);
   const [history, setHistory] = useState([]);
   const [notifPermission, setNotifPermission] = useState(getNotificationPermission());
   const [error, setError] = useState(null);
+  const [confirm, confirmDialog] = useConfirm();
 
   const [symbol, setSymbol] = useState("");
   const [metric1, setMetric1] = useState("price");
@@ -50,7 +45,6 @@ export default function Alerts({ onNavigateLive, refreshSignal }) {
   function reloadAlerts() {
     getAlerts().then(setAlerts).catch((err) => setError(err.message));
   }
-
   function reloadHistory() {
     getAlertHistory().then(setHistory).catch((err) => setError(err.message));
   }
@@ -60,10 +54,10 @@ export default function Alerts({ onNavigateLive, refreshSignal }) {
     reloadHistory();
   }, []);
 
-  // Refetch whenever App.jsx signals a new alert fired — this is what
-  // makes the page update live instead of only on manual refresh.
+  // A user_alert WS message means one just fired -- refetch both lists
+  // so it disappears from "Your alerts" and appears in history live.
   useEffect(() => {
-    if (refreshSignal === undefined || refreshSignal === 0) return;
+    if (!refreshSignal) return;
     reloadAlerts();
     reloadHistory();
   }, [refreshSignal]);
@@ -90,13 +84,14 @@ export default function Alerts({ onNavigateLive, refreshSignal }) {
         trading_symbol: symbol,
         condition_1_metric: metric1,
         condition_1_operator: operator1,
-        condition_1_threshold: scaleThresholdForSubmit(metric1, threshold1),
+        condition_1_threshold: scaleForSubmit(metric1, threshold1),
         condition_2_metric: hasCondition2 ? metric2 : null,
         condition_2_operator: hasCondition2 ? operator2 : null,
-        condition_2_threshold: hasCondition2 ? scaleThresholdForSubmit(metric2, threshold2) : null,
+        condition_2_threshold: hasCondition2 ? scaleForSubmit(metric2, threshold2) : null,
         combinator: hasCondition2 ? combinator : null,
         sound_enabled: soundEnabled,
       });
+      showToast(`Alert for ${symbol} created.`);
       setSymbol("");
       setThreshold1("");
       setThreshold2("");
@@ -109,228 +104,148 @@ export default function Alerts({ onNavigateLive, refreshSignal }) {
     }
   }
 
-  async function handleToggle(alertId) {
-    await toggleAlert(alertId);
-    reloadAlerts();
-  }
-
-  async function handleDelete(alertId) {
-    if (!window.confirm("Delete this alert?")) return;
-    await deleteAlert(alertId);
+  async function handleDelete(alert) {
+    const ok = await confirm("Delete this alert?", `The ${alert.trading_symbol} alert will be removed before it has a chance to trigger.`, "Delete alert", true);
+    if (!ok) return;
+    await deleteAlert(alert.id);
+    showToast(`Alert for ${alert.trading_symbol} deleted.`);
     reloadAlerts();
   }
 
   async function handleClearHistory() {
-    if (!window.confirm("Clear all alert history? This can't be undone.")) return;
+    const ok = await confirm("Clear alert history?", "This can't be undone.", "Clear history", true);
+    if (!ok) return;
     await clearAlertHistory();
     setHistory([]);
   }
 
   function conditionSummary(a) {
-    let text = `${METRIC_LABELS[a.condition_1_metric]} ${OPERATOR_LABELS[a.condition_1_operator]} ${formatThresholdForDisplay(a.condition_1_metric, a.condition_1_threshold)}`;
+    let text = `${METRIC_LABELS[a.condition_1_metric]} ${DIRECTION_LABELS[a.condition_1_operator]} ${displayThreshold(a.condition_1_metric, a.condition_1_threshold)}`;
     if (a.condition_2_metric) {
-      text += ` ${a.combinator} ${METRIC_LABELS[a.condition_2_metric]} ${OPERATOR_LABELS[a.condition_2_operator]} ${formatThresholdForDisplay(a.condition_2_metric, a.condition_2_threshold)}`;
+      text += ` ${a.combinator} ${METRIC_LABELS[a.condition_2_metric]} ${DIRECTION_LABELS[a.condition_2_operator]} ${displayThreshold(a.condition_2_metric, a.condition_2_threshold)}`;
     }
     return text;
   }
 
-  return (
-    <div style={styles.page}>
-      <header style={styles.header}>
-        <nav style={styles.nav}>
-          <span style={styles.navLink} onClick={onNavigateLive}>Live</span>
-          <span style={styles.navActive}>Alerts</span>
-        </nav>
-      </header>
+  // Once an alert fires, the backend deactivates it permanently (it's
+  // already in `history` by then) -- so only ever show the ones still
+  // waiting to trigger here.
+  const activeAlerts = alerts.filter((a) => a.is_active);
 
+  return (
+    <div>
       {notifPermission !== "granted" && notifPermission !== "unsupported" && (
-        <div style={styles.notifBanner}>
+        <div className="panel" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "10px 14px", marginBottom: 16, fontSize: 12, background: "var(--ink-soft)" }}>
           <span>Enable browser notifications to get alerts even when you're on a different tab.</span>
-          <button onClick={handleEnableNotifications}>
-            {notifPermission === "denied" ? "Blocked - check browser settings" : "Enable notifications"}
+          <button type="button" className="btn sm" onClick={handleEnableNotifications}>
+            {notifPermission === "denied" ? "Blocked — check browser settings" : "Enable notifications"}
           </button>
         </div>
       )}
 
-      <form style={styles.createCard} onSubmit={handleCreate}>
-        <div style={styles.cardTitle}>Create alert</div>
-
-        <StockSearchInput
-          placeholder="Search for a stock..."
-          onSelect={setSymbol}
-        />
-        {symbol && <div style={styles.selectedSymbol}>Selected: <strong>{symbol}</strong></div>}
-
-        <div style={styles.conditionRow}>
-          <select value={metric1} onChange={(e) => setMetric1(e.target.value)}>
-            <option value="price">Price</option>
-            <option value="value">Value (Vol x Price)</option>
-          </select>
-          <select value={operator1} onChange={(e) => setOperator1(e.target.value)}>
-            <option value="above">{">= crosses above"}</option>
-            <option value="below">{"<= crosses below"}</option>
-          </select>
-          <input
-            type="number"
-            step="any"
-            placeholder={metric1 === "value" ? "Threshold (Cr)" : "Threshold (Rs)"}
-            value={threshold1}
-            onChange={(e) => setThreshold1(e.target.value)}
-            style={styles.thresholdInput}
-          />
+      <form className="panel alert-form" style={{ margin: "6px 0 20px" }} onSubmit={handleCreate}>
+        <h2 style={{ fontSize: 16, fontWeight: 600 }}>New alert</h2>
+        <div className="field" style={{ maxWidth: 340 }}>
+          <span>Stock</span>
+          <StockSearchInput placeholder="Search for a stock" clearOnSelect={false} value={symbol} onSelect={setSymbol} />
         </div>
-        {metric1 === "value" && threshold1 && (
-          <div style={styles.hint}>= {"\u20b9"}{scaleThresholdForSubmit("value", threshold1).toLocaleString("en-IN")}</div>
-        )}
 
-        {!hasCondition2 ? (
-          <button type="button" style={styles.linkBtn} onClick={() => setHasCondition2(true)}>
-            + Add second condition
-          </button>
-        ) : (
-          <>
-            <div style={styles.combinatorRow}>
-              <select value={combinator} onChange={(e) => setCombinator(e.target.value)}>
-                <option value="AND">AND</option>
-                <option value="OR">OR</option>
-              </select>
-              <button type="button" style={styles.linkBtn} onClick={() => setHasCondition2(false)}>
-                Remove second condition
-              </button>
-            </div>
-            <div style={styles.conditionRow}>
-              <select value={metric2} onChange={(e) => setMetric2(e.target.value)}>
-                <option value="price">Price</option>
-                <option value="value">Value (Vol x Price)</option>
-              </select>
-              <select value={operator2} onChange={(e) => setOperator2(e.target.value)}>
-                <option value="above">{">= crosses above"}</option>
-                <option value="below">{"<= crosses below"}</option>
-              </select>
-              <input
-                type="number"
-                step="any"
-                placeholder={metric2 === "value" ? "Threshold (Cr)" : "Threshold (Rs)"}
-                value={threshold2}
-                onChange={(e) => setThreshold2(e.target.value)}
-                style={styles.thresholdInput}
-              />
-            </div>
-            {metric2 === "value" && threshold2 && (
-              <div style={styles.hint}>= {"\u20b9"}{scaleThresholdForSubmit("value", threshold2).toLocaleString("en-IN")}</div>
-            )}
-          </>
-        )}
+        <div className="field">
+          <span>Tell me when</span>
+          <div className="cond">
+            <select className="select" value={metric1} onChange={(e) => setMetric1(e.target.value)}>
+              <option value="price">Price</option>
+              <option value="value">Value (volume × price)</option>
+            </select>
+            <select className="select" value={operator1} onChange={(e) => setOperator1(e.target.value)}>
+              <option value="above">rises to or above</option>
+              <option value="below">falls to or below</option>
+            </select>
+            <input className="input num" inputMode="decimal" placeholder="Amount" value={threshold1} onChange={(e) => setThreshold1(e.target.value)} />
+            <span className="muted small">{metric1 === "value" ? "Cr" : "₹"}</span>
+          </div>
 
-        <label style={styles.checkboxRow}>
+          {hasCondition2 ? (
+            <>
+              <div className="seg inline" role="group" aria-label="Combine" style={{ alignSelf: "flex-start", marginTop: 10 }}>
+                <button type="button" className={combinator === "AND" ? "active" : ""} onClick={() => setCombinator("AND")}>AND</button>
+                <button type="button" className={combinator === "OR" ? "active" : ""} onClick={() => setCombinator("OR")}>OR</button>
+              </div>
+              <div className="cond" style={{ marginTop: 10 }}>
+                <select className="select" value={metric2} onChange={(e) => setMetric2(e.target.value)}>
+                  <option value="price">Price</option>
+                  <option value="value">Value (volume × price)</option>
+                </select>
+                <select className="select" value={operator2} onChange={(e) => setOperator2(e.target.value)}>
+                  <option value="above">rises to or above</option>
+                  <option value="below">falls to or below</option>
+                </select>
+                <input className="input num" inputMode="decimal" placeholder="Amount" value={threshold2} onChange={(e) => setThreshold2(e.target.value)} />
+                <span className="muted small">{metric2 === "value" ? "Cr" : "₹"}</span>
+              </div>
+              <button type="button" className="link" style={{ marginTop: 8 }} onClick={() => setHasCondition2(false)}>Remove second condition</button>
+            </>
+          ) : (
+            <button type="button" className="link" style={{ marginTop: 8, alignSelf: "flex-start" }} onClick={() => setHasCondition2(true)}>Add a second condition</button>
+          )}
+        </div>
+
+        <label className="check">
           <input type="checkbox" checked={soundEnabled} onChange={(e) => setSoundEnabled(e.target.checked)} />
-          Play sound when this alert fires
+          <span>Play a sound when it fires</span>
         </label>
 
-        {error && <div style={styles.error}>{error}</div>}
+        {error && <div className="err" role="alert">{error}</div>}
 
-        <button type="submit" disabled={submitting} style={styles.submitBtn}>
+        <button type="submit" className="btn primary" disabled={submitting} style={{ alignSelf: "flex-start" }}>
           {submitting ? "Creating..." : "Create alert"}
         </button>
       </form>
 
-      <div style={styles.cardTitle}>Your alerts</div>
-      {alerts.length === 0 ? (
-        <p style={styles.muted}>No alerts yet.</p>
+      <h2 className="section-title" style={{ marginTop: 0 }}>Your alerts</h2>
+      <p className="muted small" style={{ margin: "-4px 0 10px" }}>Waiting to trigger. The moment one fires, it moves to Alert history below.</p>
+      {activeAlerts.length === 0 ? (
+        <div className="panel empty"><b>No alerts yet.</b>Set one above and it will tell you the moment it fires.</div>
       ) : (
-        alerts.map((a) => (
-          <div key={a.id} style={styles.alertRow}>
-            <div>
-              <div style={styles.alertSymbol}>
-                {a.trading_symbol} {!a.is_active && <span style={styles.inactiveTag}>fired / paused</span>}
+        <div className="panel">
+          {activeAlerts.map((a) => (
+            <div className="alert-row" key={a.id}>
+              <div>
+                <span className="sym">{a.trading_symbol}</span>
+                <div className="sub" style={{ maxWidth: "none" }}>{conditionSummary(a)}</div>
               </div>
-              <div style={styles.alertCondition}>{conditionSummary(a)}</div>
+              <div className="grow" />
+              <button type="button" className="btn sm danger" onClick={() => handleDelete(a)}>Delete</button>
             </div>
-            <div style={styles.alertActions}>
-              <button style={styles.smallBtn} onClick={() => handleToggle(a.id)}>
-                {a.is_active ? "Pause" : "Resume"}
-              </button>
-              <button style={styles.smallBtn} onClick={() => handleDelete(a.id)}>Delete</button>
-            </div>
-          </div>
-        ))
+          ))}
+        </div>
       )}
 
-      <div style={styles.historyHead}>
-        <span style={styles.cardTitle}>Alert history</span>
-        {history.length > 0 && (
-          <button style={styles.smallBtn} onClick={handleClearHistory}>Clear history</button>
-        )}
+      <div style={{ display: "flex", alignItems: "center", margin: "26px 0 10px" }}>
+        <h2 className="section-title" style={{ margin: 0 }}>Alert history</h2>
+        <div className="grow" />
+        {history.length > 0 && <button type="button" className="btn sm" onClick={handleClearHistory}>Clear history</button>}
       </div>
       {history.length === 0 ? (
-        <p style={styles.muted}>No alerts have triggered yet.</p>
+        <div className="panel empty"><b>Nothing has fired yet.</b></div>
       ) : (
-        <table style={styles.table}>
-          <tbody>
-            {history.map((h) => (
-              <tr key={h.id}>
-                <td style={styles.tdLeft}>{h.trading_symbol}</td>
-                <td style={styles.tdLeft}>{h.condition_summary}</td>
-                <td style={styles.tdRight} className="mono">{h.price_at_trigger}</td>
-                <td style={styles.tdRight} className="mono">
-                  {new Date(h.triggered_at).toLocaleTimeString("en-IN", { hour12: false })}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div className="panel table-panel">
+          <table className="tbl">
+            <tbody>
+              {history.map((h) => (
+                <tr key={h.id}>
+                  <td><span className="sym">{h.trading_symbol}</span></td>
+                  <td>{h.condition_summary}</td>
+                  <td className="r num">{h.price_at_trigger}</td>
+                  <td className="r num">{new Date(h.triggered_at).toLocaleTimeString("en-IN", { hour12: false })}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
+
+      {confirmDialog}
     </div>
   );
 }
-
-const styles = {
-  page: { padding: "20px 24px", maxWidth: 700, margin: "0 auto" },
-  header: {
-    display: "flex", alignItems: "center", gap: 16, marginBottom: 20,
-    paddingBottom: 16, borderBottom: "1px solid var(--border)",
-  },
-  nav: { display: "flex", gap: 16, fontSize: 13 },
-  navActive: { color: "var(--text)", fontWeight: 500, borderBottom: "2px solid var(--focus)", paddingBottom: 2 },
-  navLink: { color: "var(--text-muted)", cursor: "pointer", paddingBottom: 2 },
-  notifBanner: {
-    display: "flex", justifyContent: "space-between", alignItems: "center",
-    background: "rgba(91,140,255,0.1)", border: "1px solid rgba(91,140,255,0.3)",
-    borderRadius: 8, padding: "10px 14px", marginBottom: 16, fontSize: 12, gap: 10,
-  },
-  createCard: {
-    background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8,
-    padding: 16, marginBottom: 20, display: "flex", flexDirection: "column", gap: 10,
-  },
-  cardTitle: { fontSize: 13, fontWeight: 600, marginBottom: 4 },
-  selectedSymbol: { fontSize: 12, color: "var(--text-muted)" },
-  conditionRow: { display: "flex", gap: 8 },
-  thresholdInput: { flex: 1 },
-  hint: { fontSize: 11, color: "var(--text-muted)", marginTop: -6 },
-  combinatorRow: { display: "flex", alignItems: "center", gap: 10 },
-  linkBtn: {
-    background: "none", border: "none", color: "var(--focus)", fontSize: 12,
-    padding: 0, textAlign: "left", cursor: "pointer", width: "fit-content",
-  },
-  checkboxRow: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 },
-  error: {
-    fontSize: 12, color: "var(--negative)", background: "rgba(255, 92, 92, 0.1)",
-    border: "1px solid rgba(255, 92, 92, 0.3)", borderRadius: 6, padding: "8px 12px",
-  },
-  submitBtn: { background: "var(--focus)", borderColor: "var(--focus)", color: "#fff", marginTop: 4 },
-  muted: { color: "var(--text-muted)", fontSize: 13, marginBottom: 20 },
-  alertRow: {
-    display: "flex", justifyContent: "space-between", alignItems: "center",
-    background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8,
-    padding: "12px 14px", marginBottom: 8,
-  },
-  alertSymbol: { fontSize: 13, fontWeight: 600 },
-  inactiveTag: { fontSize: 10, color: "var(--text-muted)", fontWeight: 400, marginLeft: 6 },
-  alertCondition: { fontSize: 12, color: "var(--text-muted)", marginTop: 2 },
-  alertActions: { display: "flex", gap: 6 },
-  smallBtn: { fontSize: 11, padding: "5px 9px" },
-  historyHead: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 24, marginBottom: 8 },
-  table: { width: "100%", borderCollapse: "collapse", fontSize: 12 },
-  tdLeft: { textAlign: "left", padding: "7px 4px", borderBottom: "1px solid var(--border)" },
-  tdRight: { textAlign: "right", padding: "7px 4px", borderBottom: "1px solid var(--border)" },
-};

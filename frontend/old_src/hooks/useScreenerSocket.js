@@ -9,10 +9,10 @@ const MAX_LIVE_ROWS = 500;
  * distinguished by a "type" field the backend adds:
  *
  *   "screener_alert" (or no type) -> updates `rows`, as before
- *   "user_alert"                  -> onUserAlert callback (a price/
- *                                    value alert fired)
- *   "auto_trade"                  -> onAutoTrade callback (an auto
- *                                    order was placed, or failed)
+ *   "user_alert"                  -> onUserAlert callback (requirement 9:
+ *                                    browser notification + sound)
+ *   "auto_trade"                  -> onAutoTrade callback (requirement 10:
+ *                                    an auto order was placed, or failed)
  *
  * The two callbacks are handed to App.jsx so it can react regardless of
  * which page is showing.
@@ -58,6 +58,8 @@ export function useScreenerSocket(enabled = true, onUserAlert = null, onAutoTrad
       if (message.type === "user_alert") {
         if (onUserAlertRef.current) onUserAlertRef.current(message);
       } else if (message.type === "auto_trade") {
+        // Must be intercepted here: anything not routed above is
+        // treated as a screener row and would corrupt the table.
         if (onAutoTradeRef.current) onAutoTradeRef.current(message);
       } else {
         addOccurrence(message);

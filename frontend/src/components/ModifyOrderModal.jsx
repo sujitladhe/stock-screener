@@ -1,16 +1,19 @@
 import { useState } from "react";
 import { modifyOrder } from "../api";
 import { showToast } from "../toast";
+import { CloseIcon } from "../icons";
+import { useDrawerMount } from "../hooks/useDrawerMount";
 
 const ORDER_TYPES = ["MKT", "LMT", "SL", "SLM"];
 
 /**
- * Modifies a still-Pending order. Only Pending orders can reach this
- * modal — Orders.jsx only shows the "Modify" action for that status
- * (see orders.py's modify endpoint, which enforces the same rule
- * server-side too, not just in the UI).
+ * Modifies a still-Pending order -- one already sitting with the
+ * broker. Orders.jsx only shows "Modify" for that status (an Active
+ * auto order that hasn't triggered yet goes through PlaceOrderModal's
+ * edit-in-place mode instead, since it isn't at the broker yet).
  */
 export default function ModifyOrderModal({ order, onClose, onModified }) {
+  const mounted = useDrawerMount();
   const [orderType, setOrderType] = useState(order.order_type);
   const [quantity, setQuantity] = useState(String(order.quantity));
   const [price, setPrice] = useState(order.price != null ? String(order.price) : "");
@@ -53,78 +56,52 @@ export default function ModifyOrderModal({ order, onClose, onModified }) {
   }
 
   return (
-    <div style={styles.overlay} onClick={onClose}>
-      <form style={styles.modal} onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit}>
-        <h2 style={styles.title}>Modify order — {order.trading_symbol}</h2>
-        <p style={styles.subtitle}>
-          {order.transaction_type === "B" ? "Buy" : "Sell"} · order #{order.broker_order_no || order.id}
-        </p>
-
-        <label style={styles.field}>
-          <span style={styles.label}>Order type</span>
-          <select value={orderType} onChange={(e) => setOrderType(e.target.value)}>
-            {ORDER_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
-          </select>
-        </label>
-
-        <div style={styles.row}>
-          {needsPrice && (
-            <label style={styles.field}>
-              <span style={styles.label}>Price</span>
-              <input type="number" step="any" value={price} onChange={(e) => setPrice(e.target.value)} />
-            </label>
-          )}
-          {needsTrigger && (
-            <label style={styles.field}>
-              <span style={styles.label}>Trigger price</span>
-              <input type="number" step="any" value={triggerPrice} onChange={(e) => setTriggerPrice(e.target.value)} />
-            </label>
-          )}
+    <div className={`scrim${mounted ? " open" : ""}`} onClick={onClose}>
+      <form className={`drawer${mounted ? " open" : ""}`} onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit}>
+        <div className="dr-head">
+          <div>
+            <h2 className="dr-title">Modify order</h2>
+            <div className="muted small">{order.trading_symbol} · {order.transaction_type === "B" ? "Buy" : "Sell"} · order #{order.broker_order_no || order.id}</div>
+          </div>
+          <button type="button" className="icon-btn" onClick={onClose} aria-label="Close" style={{ marginLeft: "auto" }}><CloseIcon size={18} /></button>
         </div>
 
-        <div style={styles.row}>
-          <label style={styles.field}>
-            <span style={styles.label}>Quantity</span>
-            <input type="number" value={quantity} onChange={(e) => setQuantity(e.target.value)} />
-          </label>
-          <label style={styles.field}>
-            <span style={styles.label}>Validity</span>
-            <select value={validity} onChange={(e) => setValidity(e.target.value)}>
-              <option value="DAY">DAY</option>
-              <option value="IOC">IOC</option>
+        <div className="dr-body">
+          <label className="field">
+            <span>Order type</span>
+            <select className="select" value={orderType} onChange={(e) => setOrderType(e.target.value)}>
+              {ORDER_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
             </select>
           </label>
+
+          <div className="grid2">
+            {needsPrice && (
+              <label className="field"><span>Price</span><input className="input num" type="number" step="any" value={price} onChange={(e) => setPrice(e.target.value)} /></label>
+            )}
+            {needsTrigger && (
+              <label className="field"><span>Trigger price</span><input className="input num" type="number" step="any" value={triggerPrice} onChange={(e) => setTriggerPrice(e.target.value)} /></label>
+            )}
+          </div>
+
+          <div className="grid2">
+            <label className="field"><span>Quantity</span><input className="input num" type="number" value={quantity} onChange={(e) => setQuantity(e.target.value)} /></label>
+            <label className="field">
+              <span>Validity</span>
+              <select className="select" value={validity} onChange={(e) => setValidity(e.target.value)}>
+                <option value="DAY">DAY</option>
+                <option value="IOC">IOC</option>
+              </select>
+            </label>
+          </div>
+
+          {error && <div className="err" role="alert">{error}</div>}
         </div>
 
-        {error && <div style={styles.error}>{error}</div>}
-
-        <button type="submit" disabled={submitting} style={styles.submitBtn}>
-          {submitting ? "Saving..." : "Save changes"}
-        </button>
-        <button type="button" style={styles.closeBtn} onClick={onClose}>Cancel</button>
+        <div className="dr-foot">
+          <button type="submit" className="btn wide primary" disabled={submitting}>{submitting ? "Saving..." : "Save changes"}</button>
+          <button type="button" className="link" style={{ alignSelf: "center" }} onClick={onClose}>Cancel</button>
+        </div>
       </form>
     </div>
   );
 }
-
-const styles = {
-  overlay: {
-    position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)",
-    display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
-  },
-  modal: {
-    background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10,
-    padding: 20, width: 340, display: "flex", flexDirection: "column", gap: 10,
-  },
-  title: { fontSize: 15, fontWeight: 600, margin: 0 },
-  subtitle: { fontSize: 12, color: "var(--text-muted)", margin: "0 0 4px 0" },
-  row: { display: "flex", gap: 10 },
-  field: { display: "flex", flexDirection: "column", gap: 4, flex: 1 },
-  label: { fontSize: 12, color: "var(--text-muted)" },
-  error: {
-    fontSize: 12, color: "var(--negative)", background: "rgba(255, 92, 92, 0.1)",
-    border: "1px solid rgba(255, 92, 92, 0.3)", borderRadius: 6, padding: "6px 10px",
-  },
-  submitBtn: { background: "var(--focus)", borderColor: "var(--focus)", color: "#fff", marginTop: 4 },
-  closeBtn: { background: "none", border: "none", color: "var(--text-muted)", fontSize: 12, marginTop: 2 },
-};

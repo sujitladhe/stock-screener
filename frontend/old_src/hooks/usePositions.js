@@ -5,12 +5,15 @@ const POLL_INTERVAL_MS = 10000;
 
 /**
  * Polls positions periodically rather than recomputing P&L from live
- * ticks ourselves -- the broker's own P&L figure is authoritative.
+ * ticks ourselves -- per ventura_trading.get_positions's own
+ * docstring, the broker's P&L figure is authoritative and this app
+ * deliberately avoids building a parallel from-scratch P&L engine.
  * "Live" here means frequently refreshed from the broker's own
  * numbers, not client-side derived.
  *
- * enabled: pass false to stay fully inert (no polling) -- used so this
- * doesn't start before the user is logged in.
+ * enabled: pass false to stay fully inert (no polling) -- used so
+ * this doesn't start before the user is logged in, same pattern as
+ * useScreenerSocket/useStockColors.
  */
 export function usePositions(enabled = true) {
   const [openPositions, setOpenPositions] = useState([]);

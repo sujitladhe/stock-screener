@@ -10,12 +10,13 @@ Covers: placement, listing (our own permanent record, synced against
 the broker's live order book for today's still-open orders, since
 Ventura's own Order Book only retains the current day), cancellation,
 and modification. record_and_place_order() is exported so
-routers/positions.py can place a stoploss exit order against a
-running position through the exact same path (same DB bookkeeping,
-same broker-credential rule) instead of duplicating this logic, and so
-a "reorder a cancelled order" flow on the frontend is just a normal
-POST /orders/place with the old order's values pre-filled -- not a
-special server-side path.
+routers/positions.py can place a stoploss exit order (and the frontend's
+"Exit position" button, which is just a normal opposite-direction
+order) against a running position through the exact same path (same DB
+bookkeeping, same broker-credential rule) instead of duplicating this
+logic, and so a "reorder a cancelled order" flow on the frontend is
+just a normal POST /orders/place with the old order's values
+pre-filled -- not a special server-side path.
 
 AUTO TRADE (requirement 10): POST /orders/auto saves an order that the
 live engine will place BY ITSELF once its volume / green-candle
@@ -23,6 +24,16 @@ condition is met (see app/auto_trade_engine.py). It's stored in the
 same `orders` table with source="auto" and status "Active" until it
 fires, so the list, cancel and status-sync code below serve both kinds.
 GET /orders takes ?source=manual|auto|all for the Orders page dropdown.
+
+EDITING A STILL-ACTIVE AUTO ORDER (new): PATCH /orders/{id}/auto lets
+the owner change a saved-but-not-yet-triggered auto order's quantity,
+order type, price/trigger, and its trigger conditions -- in place, same
+id and placed_at, since nothing has been sent to the broker yet. This
+is deliberately a SEPARATE endpoint from PATCH /orders/{id}/modify,
+which is for a Pending order already sitting with the broker (a
+totally different operation -- Ventura's modify call, not a plain DB
+update) and only ever touches quantity/price/trigger/validity, never
+the auto-trigger fields an Active order still has.
 
 All stored timestamps use now_ist_naive() (see models.py) instead of
 datetime.utcnow() -- a real bug had order placement times displayed
@@ -80,6 +91,8 @@ class CreateAutoOrderRequest(PlaceOrderRequest):
     """
     A normal order definition PLUS the condition that should release it.
     At least one of volume_threshold / candle_pct_threshold is required.
+    Also reused, unchanged, as the request body for PATCH .../auto
+    (editing a still-Active auto order sends this same full shape).
     """
     # Volume value (volume x price) in RAW RUPEES. The frontend converts
     # what the user types in crores (6 -> 60000000) before sending, per
@@ -89,10 +102,8 @@ class CreateAutoOrderRequest(PlaceOrderRequest):
     candle_pct_threshold: Optional[float] = None
     # "AND" / "OR" -- required only when BOTH thresholds are given.
     combinator: Optional[str] = None
-    # Optional "HH:MM" IST cut-off (minutes only). The order stays valid
-    # through the whole of that minute (09:30 -> until 09:30:59) and is
-    # held from the next one; it stays active and is checked again the
-    # next trading day.
+    # Optional "HH:MM" IST cut-off. After it, the order won't trigger
+    # that day; it stays active and is checked again the next trading day.
     valid_till: Optional[str] = None
 
 
@@ -170,7 +181,8 @@ def _parse_valid_till(value: Optional[str]) -> Optional[dtime]:
 def _validate_auto_order(req: CreateAutoOrderRequest) -> Optional[dtime]:
     """
     Validates everything about an auto order up front, because it will
-    be sent later with nobody watching. Returns the parsed valid_till.
+    be sent later (or resent, on an edit) with nobody watching. Returns
+    the parsed valid_till. Shared by create AND edit-in-place.
     """
     if req.order_kind not in ("delivery", "intraday"):
         raise HTTPException(status_code=400, detail="order_kind must be 'delivery' or 'intraday'")
@@ -210,6 +222,31 @@ def _validate_auto_order(req: CreateAutoOrderRequest) -> Optional[dtime]:
             raise HTTPException(status_code=400, detail="combinator must be 'AND' or 'OR' when both conditions are set.")
 
     return _parse_valid_till(req.valid_till)
+
+
+def _lookup_tradeable_instrument(db: Session, trading_symbol: str) -> Instrument:
+    """
+    Shared by create_auto_order and update_auto_order: the symbol must
+    be a known, active NSE/EQ instrument AND already have a computed
+    average volume (the same universe the live engine/screener scans),
+    or an auto order on it could never trigger.
+    """
+    instrument = (
+        db.query(Instrument)
+        .filter_by(trading_symbol=trading_symbol, exchange="NSE", instrument_type="EQ", is_active=True)
+        .first()
+    )
+    if not instrument:
+        raise HTTPException(status_code=404, detail=f"Unknown or inactive symbol: {trading_symbol}")
+
+    has_live_feed = db.query(VolumeAverage).filter_by(instrument_id=instrument.id).first()
+    if not has_live_feed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{instrument.trading_symbol} isn't in the live feed yet (no average volume has been "
+                   f"computed for it), so an auto order on it could never trigger.",
+        )
+    return instrument
 
 
 def _sync_todays_open_orders_with_broker(db: Session, session: UserSession) -> None:
@@ -291,11 +328,12 @@ def record_and_place_order(
 ) -> dict:
     """
     Shared "look up instrument, call broker, persist an Order row"
-    logic -- used by POST /orders/place below AND by
-    routers/positions.py's stoploss-exit endpoint, so a stoploss order
-    placed against a running position gets EXACTLY the same handling
-    (same audit trail, same rejection bookkeeping) as any other order,
-    rather than a second, drifting implementation.
+    logic -- used by POST /orders/place below, by routers/positions.py's
+    stoploss-exit endpoint, and by the frontend's "Exit position" button
+    (which is just POST /orders/place with the opposite transaction_type
+    and no trigger), so every kind of order placed through this app gets
+    identical handling (same audit trail, same rejection bookkeeping)
+    rather than several drifting implementations.
 
     Raises HTTPException on any validation or broker-level failure, so
     callers can just let it propagate.
@@ -457,25 +495,7 @@ def create_auto_order(
     engine simply starts checking at the next market open.
     """
     valid_till = _validate_auto_order(req)
-
-    instrument = (
-        db.query(Instrument)
-        .filter_by(trading_symbol=req.trading_symbol, exchange="NSE", instrument_type="EQ", is_active=True)
-        .first()
-    )
-    if not instrument:
-        raise HTTPException(status_code=404, detail=f"Unknown or inactive symbol: {req.trading_symbol}")
-
-    # The engine only receives live ticks for stocks that have a
-    # computed average volume (the same universe the screener scans).
-    # Refuse up front rather than accept an order that could never fire.
-    has_live_feed = db.query(VolumeAverage).filter_by(instrument_id=instrument.id).first()
-    if not has_live_feed:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{instrument.trading_symbol} isn't in the live feed yet (no average volume has been "
-                   f"computed for it), so an auto order on it could never trigger.",
-        )
+    instrument = _lookup_tradeable_instrument(db, req.trading_symbol)
 
     order = Order(
         client_id=session.client_id,
@@ -507,6 +527,80 @@ def create_auto_order(
     # isn't running yet -- it reloads every Active auto order from the
     # database when it starts).
     auto_trade_registry.add_order(order)
+
+    return _serialize_order(order)
+
+
+@router.patch("/{order_id}/auto")
+def update_auto_order(
+    order_id: int,
+    req: CreateAutoOrderRequest,
+    db: Session = Depends(get_db),
+    session: UserSession = Depends(get_current_session),
+):
+    """
+    Edits a still-Active auto order IN PLACE -- same id and placed_at,
+    since nothing has been sent to the broker yet. Lets the owner change
+    everything: quantity, order type, price/trigger, kind/product, and
+    the trigger conditions themselves (volume value, candle %, AND/OR,
+    valid-till).
+
+    Uses a conditional UPDATE (status must still be 'Active' at write
+    time), the same guard cancel_order() below uses -- if the live
+    engine claims this exact order to fire it in the instant between
+    this request's read and its write, the edit is rejected with a 409
+    instead of silently overwriting whatever the engine just recorded.
+    """
+    order = (
+        db.query(Order)
+        .filter_by(id=order_id, client_id=session.client_id, source="auto")
+        .first()
+    )
+    if not order:
+        raise HTTPException(status_code=404, detail="Auto order not found.")
+    if order.status != "Active":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only a still-waiting (Active) auto order can be edited this way (this one is {order.status}).",
+        )
+
+    valid_till = _validate_auto_order(req)
+    instrument = _lookup_tradeable_instrument(db, req.trading_symbol)
+
+    update_fields = {
+        "instrument_id": instrument.id,
+        "trading_symbol": instrument.trading_symbol,
+        "order_kind": req.order_kind,
+        "transaction_type": req.transaction_type,
+        "order_type": req.order_type,
+        "product": req.product,
+        "quantity": req.quantity,
+        "price": req.price,
+        "trigger_price": req.trigger_price,
+        "validity": req.validity,
+        "stoploss_percentage": req.stoploss_percentage,
+        "stoploss_value": req.stoploss_value,
+        "auto_volume_threshold": req.volume_threshold,
+        "auto_candle_pct_threshold": req.candle_pct_threshold,
+        "auto_combinator": req.combinator if (req.volume_threshold is not None and req.candle_pct_threshold is not None) else None,
+        "auto_valid_till": valid_till,
+        "broker_message": "Waiting for the trigger condition. Not sent to the broker yet.",
+    }
+
+    changed = (
+        db.query(Order)
+        .filter(Order.id == order.id, Order.status == "Active")
+        .update(update_fields, synchronize_session=False)
+    )
+    db.commit()
+    if not changed:
+        raise HTTPException(
+            status_code=409,
+            detail="This auto order triggered at the same moment and could no longer be edited. Refresh to see its status.",
+        )
+
+    db.refresh(order)
+    auto_trade_registry.add_order(order)  # refresh the engine's in-memory copy with the new conditions
 
     return _serialize_order(order)
 
@@ -618,8 +712,9 @@ def modify_order(
     Ventura's modify calls (like most brokers') are assumed to expect
     the full order, not a partial diff.
 
-    An auto order that is still waiting (Active) can't be modified --
-    it has no broker order yet. Cancel it and create a new one.
+    An auto order that is still waiting (Active) can't be modified here
+    -- it has no broker order yet, so PATCH /orders/{id}/auto (above)
+    is what the frontend uses for that instead.
     """
     order = db.query(Order).filter_by(id=order_id, client_id=session.client_id).first()
     if not order:

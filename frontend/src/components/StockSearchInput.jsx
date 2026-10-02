@@ -1,18 +1,22 @@
 import { useState, useEffect, useRef } from "react";
 import { searchInstruments } from "../api";
+import { SearchIcon, CloseIcon } from "../icons";
 
 /**
- * Debounced search-as-you-type against our ~2,655-stock instrument
- * database. Extracted as a shared component since both the Watchlist
- * page and the Alerts page need "search for any stock, pick one" --
- * duplicating the debounce/dropdown logic in two places would have
- * let them drift apart over time.
+ * Debounced search-as-you-type against the shared instrument database.
+ * Used anywhere the user picks ONE stock to act on next (placing an
+ * order, adding to a watchlist, creating an alert) -- as opposed to
+ * FilterInput, which narrows what's already on screen.
  */
-export default function StockSearchInput({ placeholder, onSelect, clearOnSelect = true }) {
-  const [query, setQuery] = useState("");
+export default function StockSearchInput({ placeholder, onSelect, clearOnSelect = true, value: controlledValue }) {
+  const [query, setQuery] = useState(controlledValue || "");
   const [results, setResults] = useState([]);
   const [open, setOpen] = useState(false);
   const debounceRef = useRef(null);
+
+  useEffect(() => {
+    if (controlledValue !== undefined) setQuery(controlledValue);
+  }, [controlledValue]);
 
   useEffect(() => {
     clearTimeout(debounceRef.current);
@@ -37,46 +41,44 @@ export default function StockSearchInput({ placeholder, onSelect, clearOnSelect 
     setOpen(false);
   }
 
+  function handleClear() {
+    setQuery("");
+    setResults([]);
+    setOpen(false);
+  }
+
   return (
-    <div style={styles.wrap}>
+    <div className="ss">
+      <span className="ss-icon"><SearchIcon /></span>
       <input
-        style={styles.input}
+        className="input"
         placeholder={placeholder || "Search by symbol or name..."}
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onFocus={() => results.length > 0 && setOpen(true)}
         onBlur={() => setTimeout(() => setOpen(false), 150)}
+        aria-label={placeholder || "Search by symbol or name"}
       />
+      {query && (
+        <button type="button" className="ss-clear" aria-label="Clear search" onMouseDown={(e) => { e.preventDefault(); handleClear(); }}>
+          <CloseIcon size={14} />
+        </button>
+      )}
       {open && results.length > 0 && (
-        <div style={styles.dropdown}>
+        <div className="ss-list">
           {results.map((r) => (
-            <div
+            <button
+              type="button"
               key={r.trading_symbol}
-              style={styles.dropdownItem}
+              className="ss-item"
               onMouseDown={() => handleSelect(r.trading_symbol)}
             >
-              <span style={styles.dropdownSymbol}>{r.trading_symbol}</span>
-              <span style={styles.dropdownName}>{r.name}</span>
-            </div>
+              <b>{r.trading_symbol}</b>
+              <span>{r.name}</span>
+            </button>
           ))}
         </div>
       )}
     </div>
   );
 }
-
-const styles = {
-  wrap: { position: "relative" },
-  input: { width: "100%" },
-  dropdown: {
-    position: "absolute", top: "100%", left: 0, right: 0, zIndex: 10, marginTop: 4,
-    background: "var(--surface-2, var(--surface))", border: "1px solid var(--border)", borderRadius: 6,
-    maxHeight: 220, overflowY: "auto",
-  },
-  dropdownItem: {
-    padding: "8px 10px", cursor: "pointer", display: "flex", justifyContent: "space-between", gap: 10,
-    borderBottom: "1px solid var(--border)", fontSize: 12,
-  },
-  dropdownSymbol: { fontWeight: 600, flexShrink: 0 },
-  dropdownName: { color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-};

@@ -141,6 +141,14 @@ export async function createAlert(payload) {
   return handleJson(res, "Failed to create alert");
 }
 
+export async function toggleAlert(alertId) {
+  const res = await fetch(`${API_BASE}/alerts/${alertId}/toggle`, {
+    method: "PATCH",
+    credentials: "include",
+  });
+  return handleJson(res, "Failed to toggle alert");
+}
+
 export async function deleteAlert(alertId) {
   const res = await fetch(`${API_BASE}/alerts/${alertId}`, {
     method: "DELETE",
@@ -192,21 +200,6 @@ export async function createAutoOrder(payload) {
     body: JSON.stringify(payload),
   });
   return handleJson(res, "Failed to create auto order");
-}
-
-// Edits a still-ACTIVE auto order in place (nothing has been sent to
-// the broker yet, so this rewrites the saved order and its trigger
-// conditions -- same id, same placed_at). Only valid while the order
-// is still Active; once it's fired this 404s and the normal /modify
-// endpoint (for a broker-side Pending order) takes over instead.
-export async function updateAutoOrder(orderId, payload) {
-  const res = await fetch(`${API_BASE}/orders/${orderId}/auto`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(payload),
-  });
-  return handleJson(res, "Failed to update auto order");
 }
 
 export async function cancelOrder(orderId) {

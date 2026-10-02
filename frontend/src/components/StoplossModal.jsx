@@ -1,11 +1,9 @@
 import { useState } from "react";
 import { placeStoplossOrder } from "../api";
 import { showToast } from "../toast";
+import { CloseIcon } from "../icons";
+import { useDrawerMount } from "../hooks/useDrawerMount";
 
-// Same fix as PlaceOrderModal.jsx: product options are scoped to
-// order kind, and changing kind auto-syncs product, rather than
-// letting them drift out of sync (which caused a real Ventura
-// rejection: "EXCH: Not Specified").
 const PRODUCTS_BY_KIND = {
   delivery: [{ value: "C", label: "C — CNC (delivery)" }],
   intraday: [
@@ -16,22 +14,14 @@ const PRODUCTS_BY_KIND = {
 
 /**
  * Sets a stoploss (exit) order for a currently-held position.
- *
- * defaultTransactionType comes pre-selected from Positions.jsx, which
- * derives it from Ventura's confirmed, SIGNED `total_quantity` field
- * (negative = short position, needs a Buy to exit; positive = long,
- * needs a Sell). The dropdown stays editable rather than locked, so
- * this is a reliable default, not a forced choice — worth a glance
- * before submitting since real money is behind it either way.
+ * defaultTransactionType is derived by Positions.jsx from the
+ * broker's signed total_quantity (negative = short, needs a Buy to
+ * exit). The dropdown stays editable rather than locked.
  */
 export default function StoplossModal({ position, defaultTransactionType, onClose, onPlaced }) {
+  const mounted = useDrawerMount();
   const [transactionType, setTransactionType] = useState(defaultTransactionType || "S");
-  // total_quantity from the broker is SIGNED (negative for a short
-  // position) -- an order's quantity must always be positive, so the
-  // default here is the absolute value, not the raw signed number.
-  const [quantity, setQuantity] = useState(
-    position.quantity != null ? String(Math.abs(position.quantity)) : ""
-  );
+  const [quantity, setQuantity] = useState(position.quantity != null ? String(Math.abs(position.quantity)) : "");
   const [orderType, setOrderType] = useState("SLM");
   const [triggerPrice, setTriggerPrice] = useState("");
   const [price, setPrice] = useState("");
@@ -89,116 +79,64 @@ export default function StoplossModal({ position, defaultTransactionType, onClos
   }
 
   return (
-    <div style={styles.overlay} onClick={onClose}>
-      <form style={styles.modal} onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit}>
-        <h2 style={styles.title}>Set stoploss — {position.symbol}</h2>
-        <p style={styles.subtitle}>Currently held: {position.quantity ?? "?"} @ {position.averagePrice ?? "?"}</p>
-
-        <label style={styles.field}>
-          <span style={styles.label}>Exit direction (pre-filled from your position, editable)</span>
-          <select value={transactionType} onChange={(e) => setTransactionType(e.target.value)}>
-            <option value="S">Sell (exits a long/buy position)</option>
-            <option value="B">Buy (exits a short/sell position)</option>
-          </select>
-        </label>
-
-        <div style={styles.row}>
-          <label style={styles.field}>
-            <span style={styles.label}>Order type</span>
-            <select value={orderType} onChange={(e) => setOrderType(e.target.value)}>
-              <option value="SLM">SLM — market on trigger</option>
-              <option value="SL">SL — limit on trigger</option>
-            </select>
-          </label>
-          <label style={styles.field}>
-            <span style={styles.label}>Quantity</span>
-            <input type="number" value={quantity} onChange={(e) => setQuantity(e.target.value)} />
-          </label>
+    <div className={`scrim${mounted ? " open" : ""}`} onClick={onClose}>
+      <form className={`drawer${mounted ? " open" : ""}`} onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit}>
+        <div className="dr-head">
+          <div>
+            <h2 className="dr-title">Set stoploss</h2>
+            <div className="muted small">{position.symbol}, holding {position.quantity ?? "?"} at {position.averagePrice ?? "?"}</div>
+          </div>
+          <button type="button" className="icon-btn" onClick={onClose} aria-label="Close" style={{ marginLeft: "auto" }}><CloseIcon size={18} /></button>
         </div>
 
-        <div style={styles.row}>
-          <label style={styles.field}>
-            <span style={styles.label}>Trigger price</span>
-            <input type="number" step="any" value={triggerPrice} onChange={(e) => setTriggerPrice(e.target.value)} />
+        <div className="dr-body">
+          <label className="field">
+            <span>Exit direction (pre-filled from your position, editable)</span>
+            <select className="select" value={transactionType} onChange={(e) => setTransactionType(e.target.value)}>
+              <option value="S">Sell (exits a long/buy position)</option>
+              <option value="B">Buy (exits a short/sell position)</option>
+            </select>
           </label>
-          {orderType === "SL" && (
-            <label style={styles.field}>
-              <span style={styles.label}>Limit price</span>
-              <input type="number" step="any" value={price} onChange={(e) => setPrice(e.target.value)} />
+
+          <div className="grid2">
+            <label className="field">
+              <span>Order type</span>
+              <select className="select" value={orderType} onChange={(e) => setOrderType(e.target.value)}>
+                <option value="SLM">SLM — market on trigger</option>
+                <option value="SL">SL — limit on trigger</option>
+              </select>
             </label>
-          )}
+            <label className="field"><span>Quantity</span><input className="input num" type="number" value={quantity} onChange={(e) => setQuantity(e.target.value)} /></label>
+          </div>
+
+          <div className="grid2">
+            <label className="field"><span>Trigger price</span><input className="input num" type="number" step="any" value={triggerPrice} onChange={(e) => setTriggerPrice(e.target.value)} /></label>
+            {orderType === "SL" && (
+              <label className="field"><span>Limit price</span><input className="input num" type="number" step="any" value={price} onChange={(e) => setPrice(e.target.value)} /></label>
+            )}
+          </div>
+
+          <div className="grid2">
+            <div className="seg" role="group" aria-label="Intraday or delivery">
+              <button type="button" className={orderKind === "intraday" ? "active" : ""} onClick={() => handleOrderKindChange("intraday")}>Intraday</button>
+              <button type="button" className={orderKind === "delivery" ? "active" : ""} onClick={() => handleOrderKindChange("delivery")}>Delivery</button>
+            </div>
+            <label className="field">
+              <span>Product</span>
+              <select className="select" value={product} onChange={(e) => setProduct(e.target.value)}>
+                {productOptions.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+              </select>
+            </label>
+          </div>
+
+          {error && <div className="err" role="alert">{error}</div>}
         </div>
 
-        <div style={styles.row}>
-          <label style={styles.field}>
-            <span style={styles.label}>Order kind</span>
-            <ToggleGroup value={orderKind} onChange={handleOrderKindChange} options={[
-              { value: "intraday", label: "Intraday" },
-              { value: "delivery", label: "Delivery" },
-            ]} />
-          </label>
-          <label style={styles.field}>
-            <span style={styles.label}>Product</span>
-            <select value={product} onChange={(e) => setProduct(e.target.value)}>
-              {productOptions.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
-            </select>
-          </label>
+        <div className="dr-foot">
+          <button type="submit" className="btn wide primary" disabled={submitting}>{submitting ? "Placing..." : "Place stoploss order"}</button>
+          <button type="button" className="link" style={{ alignSelf: "center" }} onClick={onClose}>Cancel</button>
         </div>
-
-        {error && <div style={styles.error}>{error}</div>}
-
-        <button type="submit" disabled={submitting} style={styles.submitBtn}>
-          {submitting ? "Placing..." : "Place stoploss order"}
-        </button>
-        <button type="button" style={styles.closeBtn} onClick={onClose}>Cancel</button>
       </form>
     </div>
   );
 }
-
-function ToggleGroup({ value, onChange, options }) {
-  return (
-    <div style={styles.toggleGroup}>
-      {options.map((opt) => (
-        <button
-          type="button"
-          key={opt.value}
-          onClick={() => onChange(opt.value)}
-          style={{
-            ...styles.toggleBtn,
-            background: value === opt.value ? "var(--focus)" : "var(--surface)",
-            color: value === opt.value ? "#fff" : "var(--text)",
-            borderColor: value === opt.value ? "var(--focus)" : "var(--border)",
-          }}
-        >
-          {opt.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-const styles = {
-  overlay: {
-    position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)",
-    display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
-  },
-  modal: {
-    background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10,
-    padding: 20, width: 380, display: "flex", flexDirection: "column", gap: 10,
-    maxHeight: "90vh", overflowY: "auto",
-  },
-  title: { fontSize: 15, fontWeight: 600, margin: 0 },
-  subtitle: { fontSize: 12, color: "var(--text-muted)", margin: "0 0 4px 0" },
-  row: { display: "flex", gap: 10 },
-  field: { display: "flex", flexDirection: "column", gap: 4, flex: 1 },
-  label: { fontSize: 11, color: "var(--text-muted)" },
-  toggleGroup: { display: "flex", gap: 4 },
-  toggleBtn: { flex: 1, padding: "7px 0", fontSize: 11, border: "1px solid" },
-  error: {
-    fontSize: 12, color: "var(--negative)", background: "rgba(255, 92, 92, 0.1)",
-    border: "1px solid rgba(255, 92, 92, 0.3)", borderRadius: 6, padding: "6px 10px",
-  },
-  submitBtn: { background: "var(--accent-strict)", borderColor: "var(--accent-strict)", color: "#fff", marginTop: 4 },
-  closeBtn: { background: "none", border: "none", color: "var(--text-muted)", fontSize: 12, marginTop: 2 },
-};

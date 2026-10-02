@@ -1,6 +1,17 @@
 import { useState } from "react";
 import { login } from "../api";
 
+function BrandMark() {
+  return (
+    <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
+      <rect width="28" height="28" rx="8" fill="var(--text)" />
+      <rect x="6" y="15" width="3.6" height="7" rx="1.2" fill="var(--ground)" />
+      <rect x="12.2" y="11" width="3.6" height="11" rx="1.2" fill="var(--ground)" />
+      <rect x="18.4" y="6" width="3.6" height="16" rx="1.2" fill="var(--mari)" />
+    </svg>
+  );
+}
+
 export default function Login({ onLoggedIn }) {
   const [form, setForm] = useState({
     app_key: "",
@@ -31,95 +42,43 @@ export default function Login({ onLoggedIn }) {
   }
 
   return (
-    <div style={styles.page}>
-      <form style={styles.card} onSubmit={handleSubmit}>
-        <h1 style={styles.title}>Sign in</h1>
-        <p style={styles.subtitle}>Enter your Ventura API credentials.</p>
+    <div className="login">
+      <div className="login-art">
+        <span className="brand"><BrandMark />Screener</span>
+        <div>
+          <h2>See the volume surge as it happens.</h2>
+          <p>Every NSE stock, checked minute by minute, with your orders one tap away.</p>
+        </div>
+        <p className="muted small">Trades are placed only through your own Ventura account.</p>
+      </div>
+      <div className="login-form">
+        <form onSubmit={handleSubmit}>
+          <h1>Sign in</h1>
+          <p className="muted">Enter your Ventura API credentials.</p>
 
-        <Field label="App key" value={form.app_key} onChange={update("app_key")} />
-        <Field label="App secret" value={form.app_secret} onChange={update("app_secret")} type="password" />
-        <Field label="Client ID" value={form.client_id} onChange={update("client_id")} />
-        <Field label="PIN" value={form.pin} onChange={update("pin")} type="password" />
-        <Field
-          label="TOTP secret"
-          value={form.totp_secret}
-          onChange={update("totp_secret")}
-          type="password"
-          hint="The authenticator secret key, not the 6-digit code."
-        />
+          <Field label="App key" value={form.app_key} onChange={update("app_key")} />
+          <Field label="App secret" value={form.app_secret} onChange={update("app_secret")} type="password" />
+          <Field label="Client ID" value={form.client_id} onChange={update("client_id")} />
+          <Field label="PIN" value={form.pin} onChange={update("pin")} type="password" />
+          <Field label="TOTP secret" value={form.totp_secret} onChange={update("totp_secret")} type="password" hint="The authenticator secret key, not the 6-digit code." />
 
-        {error && <div style={styles.error}>{error}</div>}
+          {error && <div className="err" role="alert">{error}</div>}
 
-        <button type="submit" disabled={submitting} style={styles.submit}>
-          {submitting ? "Signing in..." : "Sign in"}
-        </button>
-      </form>
+          <button type="submit" className="btn primary wide" disabled={submitting} style={{ marginTop: 6 }}>
+            {submitting ? "Signing in..." : "Sign in"}
+          </button>
+        </form>
+      </div>
     </div>
   );
 }
 
 function Field({ label, value, onChange, type = "text", hint }) {
   return (
-    <label style={styles.field}>
-      <span style={styles.label}>{label}</span>
-      <input type={type} value={value} onChange={onChange} required style={styles.input} />
-      {hint && <span style={styles.hint}>{hint}</span>}
+    <label className="field">
+      <span>{label}</span>
+      <input className="input" type={type} value={value} onChange={onChange} required />
+      {hint && <span className="hint">{hint}</span>}
     </label>
   );
 }
-
-const styles = {
-  page: {
-    minHeight: "100%",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    padding: 20,
-  },
-  card: {
-    width: 360,
-    display: "flex",
-    flexDirection: "column",
-    gap: 14,
-  },
-  title: {
-    fontSize: 20,
-    fontWeight: 600,
-    margin: 0,
-  },
-  subtitle: {
-    fontSize: 13,
-    color: "var(--text-muted)",
-    margin: "0 0 8px 0",
-  },
-  field: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 4,
-  },
-  label: {
-    fontSize: 12,
-    color: "var(--text-muted)",
-  },
-  input: {
-    padding: "9px 12px",
-  },
-  hint: {
-    fontSize: 11,
-    color: "var(--text-muted)",
-  },
-  error: {
-    fontSize: 13,
-    color: "var(--negative)",
-    background: "rgba(255, 92, 92, 0.1)",
-    border: "1px solid rgba(255, 92, 92, 0.3)",
-    borderRadius: 6,
-    padding: "8px 12px",
-  },
-  submit: {
-    marginTop: 6,
-    background: "var(--focus)",
-    borderColor: "var(--focus)",
-    color: "#fff",
-  },
-};
