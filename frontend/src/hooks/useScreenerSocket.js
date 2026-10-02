@@ -4,18 +4,23 @@ import { openScreenerSocket, getTodayScreener } from "../api";
 const MAX_LIVE_ROWS = 500;
 
 /**
- * Manages the screener's live data AND routes personal alert
- * notifications (requirement 9) -- both travel over the SAME
- * WebSocket connection now, distinguished by a "type" field the
- * backend adds ("screener_alert" vs "user_alert"). Screener messages
- * update `rows` as before; user_alert messages are handed to the
- * onUserAlert callback instead, so App.jsx can show a browser
- * notification + play a sound regardless of which page is showing.
+ * Manages the screener's live data AND routes personal notifications
+ * -- all of it travels over the SAME WebSocket connection,
+ * distinguished by a "type" field the backend adds:
+ *
+ *   "screener_alert" (or no type) -> updates `rows`, as before
+ *   "user_alert"                  -> onUserAlert callback (requirement 9:
+ *                                    browser notification + sound)
+ *   "auto_trade"                  -> onAutoTrade callback (requirement 10:
+ *                                    an auto order was placed, or failed)
+ *
+ * The two callbacks are handed to App.jsx so it can react regardless of
+ * which page is showing.
  *
  * enabled: pass false to keep this fully inert (no fetch, no socket)
  * -- used so the connection doesn't open before the user is logged in.
  */
-export function useScreenerSocket(enabled = true, onUserAlert = null) {
+export function useScreenerSocket(enabled = true, onUserAlert = null, onAutoTrade = null) {
   const [rows, setRows] = useState([]);
   const [connectionStatus, setConnectionStatus] = useState("connecting");
   const [flashRowId, setFlashRowId] = useState(null);
@@ -24,6 +29,8 @@ export function useScreenerSocket(enabled = true, onUserAlert = null) {
   const hasConnectedOnceRef = useRef(false);
   const onUserAlertRef = useRef(onUserAlert);
   onUserAlertRef.current = onUserAlert;
+  const onAutoTradeRef = useRef(onAutoTrade);
+  onAutoTradeRef.current = onAutoTrade;
 
   const addOccurrence = useCallback((newRow) => {
     setRows((prev) => {
@@ -50,6 +57,10 @@ export function useScreenerSocket(enabled = true, onUserAlert = null) {
       const message = JSON.parse(event.data);
       if (message.type === "user_alert") {
         if (onUserAlertRef.current) onUserAlertRef.current(message);
+      } else if (message.type === "auto_trade") {
+        // Must be intercepted here: anything not routed above is
+        // treated as a screener row and would corrupt the table.
+        if (onAutoTradeRef.current) onAutoTradeRef.current(message);
       } else {
         addOccurrence(message);
       }

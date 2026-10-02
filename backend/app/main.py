@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from app.routers import auth, screener, watchlist, instruments, orders, alerts, positions
 from app.ws_manager import manager
 from app import ws_client
+from app import engine_scheduler
 from app.config import settings
 
 # Schema management is now handled by Alembic (see alembic/ folder),
@@ -72,14 +73,34 @@ async def start_live_engine():
     in .env while iterating on API/UI code with --reload, so every
     restart doesn't reconnect to Ventura and resubscribe to all
     ~2,655 stocks.
+
+    Two modes (settings.engine_scheduler_enabled):
+      - false (default): start the engine right now and let it run for
+        as long as the process lives — the original behaviour, where
+        root's cron starts/stops the whole service around market hours.
+      - true: hand control to engine_scheduler, which keeps the web app
+        up all day and runs the engine only inside the 9:14 AM - 3:31 PM
+        IST window on trading days. This is what lets users create auto
+        orders after market hours (requirement 10d).
     """
-    if settings.auto_start_live_engine:
-        asyncio.create_task(ws_client.run_engine(
+    if not settings.auto_start_live_engine:
+        print("Live engine NOT started (AUTO_START_LIVE_ENGINE=false in .env).")
+        return
+
+    if settings.engine_scheduler_enabled:
+        print("Engine scheduler ENABLED — the live engine will run only inside the market window.")
+        coro = engine_scheduler.run_engine_on_schedule(
             on_alert=manager.broadcast,
             on_user_alert=manager.send_to_client,
-        ))
+        )
     else:
-        print("Live engine NOT started (AUTO_START_LIVE_ENGINE=false in .env).")
+        coro = ws_client.run_engine(
+            on_alert=manager.broadcast,
+            on_user_alert=manager.send_to_client,
+        )
+
+    # Keep a reference on the app so the task can't be garbage-collected.
+    app.state.engine_task = asyncio.create_task(coro)
 
 
 @app.get("/health")

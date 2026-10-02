@@ -172,8 +172,11 @@ export async function clearAlertHistory() {
 
 // --- Orders ---
 
-export async function getOrders() {
-  const res = await fetch(`${API_BASE}/orders`, { credentials: "include" });
+// source: "manual" | "auto" | "all" -- drives the Orders page dropdown.
+export async function getOrders(source = "all") {
+  const url = new URL(`${API_BASE}/orders`);
+  url.searchParams.set("source", source);
+  const res = await fetch(url, { credentials: "include" });
   return handleJson(res, "Failed to load orders");
 }
 
@@ -185,6 +188,18 @@ export async function placeOrder(payload) {
     body: JSON.stringify(payload),
   });
   return handleJson(res, "Failed to place order");
+}
+
+// Saves an AUTO order: the server places it later, by itself, once its
+// volume / green-candle condition is met (requirement 10).
+export async function createAutoOrder(payload) {
+  const res = await fetch(`${API_BASE}/orders/auto`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(payload),
+  });
+  return handleJson(res, "Failed to create auto order");
 }
 
 export async function cancelOrder(orderId) {

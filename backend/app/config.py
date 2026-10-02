@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     # without the engine if this is forgotten in .env.
     auto_start_live_engine: bool = True
 
+    # OPT-IN (default false = behaves exactly as before). When true, the
+    # web app can stay running all day and night and starts/stops the
+    # live engine ITSELF at 9:14 AM / 3:31 PM IST on trading days (see
+    # app/engine_scheduler.py), instead of relying on root's cron to
+    # start and stop the whole service. Needed for requirement 10d
+    # (placing auto orders AFTER market hours), since with the old cron
+    # setup the website itself is down after 3:31 PM. Only has an
+    # effect when auto_start_live_engine is also true.
+    engine_scheduler_enabled: bool = False
+
     # Comma-separated list of origins allowed to call this API from a
     # browser (CORS). MUST match exactly what's in your browser's
     # address bar when viewing the frontend — e.g. if you access the

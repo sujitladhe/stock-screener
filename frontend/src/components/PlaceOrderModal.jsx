@@ -1,8 +1,19 @@
 import { useState, useMemo } from "react";
-import { placeOrder } from "../api";
+import { placeOrder, createAutoOrder } from "../api";
 import { showToast } from "../toast";
 
 const ORDER_TYPES = ["MKT", "LMT", "SL", "SLM"];
+
+// 1 Crore = 1,00,00,000 = 10,000,000. Per architecture principle #9,
+// money is stored in RAW rupees in the backend/DB and the "crores"
+// convenience exists ONLY here at the input layer: the user types 6 for
+// 6 Cr (0.6 = 60 Lac, 0.06 = 6 Lac) and we convert to rupees on submit.
+const ONE_CRORE = 10000000;
+
+// Auto orders are only ever checked inside these IST market hours (the
+// backend enforces the same range for "valid till").
+const MARKET_OPEN_HHMM = "09:15";
+const MARKET_CLOSE_HHMM = "15:30";
 
 // Product options are scoped to order kind, not a flat shared list --
 // a real order was rejected by Ventura ("EXCH: Not Specified") when
@@ -25,6 +36,16 @@ const PRODUCTS_BY_KIND = {
  * order's full field set so it reopens as a fresh, editable order —
  * never re-submits the old one, just starts from its values).
  *
+ * TWO MODES (requirement 10):
+ *   "Place now"  — the original behaviour: the order goes to the broker
+ *                  immediately.
+ *   "Auto trade" — the order is SAVED and the server places it by
+ *                  itself once a volume-value and/or green 1-minute
+ *                  candle % condition is met (during market hours,
+ *                  optionally only until a "valid till" time). Reorder
+ *                  of an auto order reopens in this mode with its
+ *                  conditions prefilled.
+ *
  * Stoploss-based quantity (requirement 6d): entering a stoploss value
  * and percentage computes quantity as
  *   riskPerShare = referencePrice * (stoplossPercentage / 100)
@@ -35,6 +56,10 @@ const PRODUCTS_BY_KIND = {
  * editable input afterward — it's a starting point, not a lock.
  */
 export default function PlaceOrderModal({ symbol, defaultReferencePrice, prefillOrder, onClose, onPlaced }) {
+  const prefillIsAuto = prefillOrder?.source === "auto";
+
+  const [mode, setMode] = useState(prefillIsAuto ? "auto" : "now");
+
   const [orderKind, setOrderKind] = useState(prefillOrder?.order_kind || "intraday");
   const [transactionType, setTransactionType] = useState(prefillOrder?.transaction_type || "B");
   const [orderType, setOrderType] = useState(prefillOrder?.order_type || "MKT");
@@ -57,12 +82,24 @@ export default function PlaceOrderModal({ symbol, defaultReferencePrice, prefill
     prefillOrder?.stoploss_value ? String(prefillOrder.stoploss_value) : ""
   );
 
+  // --- auto trade conditions ---
+  const prefillVolume = prefillIsAuto ? prefillOrder.auto_volume_threshold : null;
+  const prefillCandle = prefillIsAuto ? prefillOrder.auto_candle_pct_threshold : null;
+  const [useVolume, setUseVolume] = useState(prefillIsAuto ? prefillVolume != null : true);
+  const [volumeCr, setVolumeCr] = useState(prefillVolume != null ? String(prefillVolume / ONE_CRORE) : "");
+  const [useCandle, setUseCandle] = useState(prefillIsAuto ? prefillCandle != null : false);
+  const [candlePct, setCandlePct] = useState(prefillCandle != null ? String(prefillCandle) : "");
+  const [combinator, setCombinator] = useState(prefillOrder?.auto_combinator || "AND");
+  const [validTill, setValidTill] = useState(prefillIsAuto && prefillOrder.auto_valid_till ? prefillOrder.auto_valid_till : "");
+
   const [error, setError] = useState(null);
   const [submitting, setSubmitting] = useState(false);
 
+  const isAuto = mode === "auto";
   const needsPrice = orderType === "LMT" || orderType === "SL";
   const needsTrigger = orderType === "SL" || orderType === "SLM";
   const productOptions = PRODUCTS_BY_KIND[orderKind];
+  const sideLabel = transactionType === "B" ? "Buy" : "Sell";
 
   function handleOrderKindChange(kind) {
     setOrderKind(kind);
@@ -85,6 +122,14 @@ export default function PlaceOrderModal({ symbol, defaultReferencePrice, prefill
     if (calculatedQuantity) setQuantity(String(calculatedQuantity));
   }
 
+  // The rupee equivalent of what was typed in crores, shown as a
+  // hint so "0.06" is never ambiguous.
+  const volumeRupees = useMemo(() => {
+    const cr = parseFloat(volumeCr);
+    if (!cr || cr <= 0) return null;
+    return Math.round(cr * ONE_CRORE);
+  }, [volumeCr]);
+
   async function handleSubmit(e) {
     e.preventDefault();
     setError(null);
@@ -103,38 +148,87 @@ export default function PlaceOrderModal({ symbol, defaultReferencePrice, prefill
       return;
     }
 
+    const orderFields = {
+      trading_symbol: symbol,
+      order_kind: orderKind,
+      transaction_type: transactionType,
+      order_type: orderType,
+      quantity: qty,
+      product,
+      price: needsPrice ? parseFloat(price) : 0,
+      trigger_price: needsTrigger ? parseFloat(triggerPrice) : 0,
+      validity,
+      stoploss_percentage: useStoplossCalc && stoplossPercentage ? parseFloat(stoplossPercentage) : null,
+      stoploss_value: useStoplossCalc && stoplossValue ? parseFloat(stoplossValue) : null,
+    };
+
+    if (isAuto) {
+      if (!useVolume && !useCandle) {
+        setError("Choose at least one trigger: volume value, candle %, or both.");
+        return;
+      }
+      let volumeThreshold = null;
+      let candleThreshold = null;
+      if (useVolume) {
+        if (!volumeRupees) {
+          setError("Enter the volume value in crores (6 = 6 Cr, 0.6 = 60 Lac, 0.06 = 6 Lac).");
+          return;
+        }
+        volumeThreshold = volumeRupees;
+      }
+      if (useCandle) {
+        const pct = parseFloat(candlePct);
+        if (!pct || pct <= 0) {
+          setError("Enter the candle % as a number above 0 (only green candles are tracked).");
+          return;
+        }
+        candleThreshold = pct;
+      }
+      if (validTill && (validTill < MARKET_OPEN_HHMM || validTill > MARKET_CLOSE_HHMM)) {
+        setError(`"Valid till" must be between ${MARKET_OPEN_HHMM} and ${MARKET_CLOSE_HHMM} (IST).`);
+        return;
+      }
+    }
+
     setSubmitting(true);
     try {
-      await placeOrder({
-        trading_symbol: symbol,
-        order_kind: orderKind,
-        transaction_type: transactionType,
-        order_type: orderType,
-        quantity: qty,
-        product,
-        price: needsPrice ? parseFloat(price) : 0,
-        trigger_price: needsTrigger ? parseFloat(triggerPrice) : 0,
-        validity,
-        stoploss_percentage: useStoplossCalc && stoplossPercentage ? parseFloat(stoplossPercentage) : null,
-        stoploss_value: useStoplossCalc && stoplossValue ? parseFloat(stoplossValue) : null,
-      });
-      showToast(`${transactionType === "B" ? "Buy" : "Sell"} order for ${symbol} placed successfully.`, "success");
+      if (isAuto) {
+        await createAutoOrder({
+          ...orderFields,
+          volume_threshold: useVolume ? volumeRupees : null,
+          candle_pct_threshold: useCandle ? parseFloat(candlePct) : null,
+          combinator: useVolume && useCandle ? combinator : null,
+          valid_till: validTill || null,
+        });
+        showToast(`Auto ${sideLabel} order for ${symbol} is active — it will be placed when the condition is met.`, "success");
+      } else {
+        await placeOrder(orderFields);
+        showToast(`${sideLabel} order for ${symbol} placed successfully.`, "success");
+      }
       if (onPlaced) onPlaced();
       onClose();
     } catch (err) {
-      showToast(`Order for ${symbol} failed: ${err.message}`, "error");
+      showToast(`${isAuto ? "Auto order" : "Order"} for ${symbol} failed: ${err.message}`, "error");
       setError(err.message);
     } finally {
       setSubmitting(false);
     }
   }
 
+  const title = `${prefillOrder ? "Reorder" : (isAuto ? "Auto trade" : "Place order")} — ${symbol}`;
+  const submitLabel = submitting
+    ? (isAuto ? "Saving..." : "Placing...")
+    : (isAuto ? `Create auto ${sideLabel.toLowerCase()} order` : `${sideLabel} ${symbol}`);
+
   return (
     <div style={styles.overlay} onClick={onClose}>
       <form style={styles.modal} onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit}>
-        <h2 style={styles.title}>
-          {prefillOrder ? "Reorder — " : "Place order — "}{symbol}
-        </h2>
+        <h2 style={styles.title}>{title}</h2>
+
+        <ToggleGroup value={mode} onChange={setMode} options={[
+          { value: "now", label: "Place now" },
+          { value: "auto", label: "Auto trade" },
+        ]} />
 
         <div style={styles.row}>
           <ToggleGroup value={transactionType} onChange={setTransactionType} options={[
@@ -146,6 +240,79 @@ export default function PlaceOrderModal({ symbol, defaultReferencePrice, prefill
             { value: "delivery", label: "Delivery" },
           ]} />
         </div>
+
+        {isAuto && (
+          <div style={styles.autoBox}>
+            <div style={styles.autoTitle}>Place this order automatically when</div>
+
+            <label style={styles.checkboxRow}>
+              <input type="checkbox" checked={useVolume} onChange={(e) => setUseVolume(e.target.checked)} />
+              Volume value (volume × price) is at least
+            </label>
+            {useVolume && (
+              <>
+                <div style={styles.unitRow}>
+                  <input
+                    type="number"
+                    step="any"
+                    min="0"
+                    placeholder="e.g. 6"
+                    value={volumeCr}
+                    onChange={(e) => setVolumeCr(e.target.value)}
+                    style={styles.input}
+                  />
+                  <span style={styles.unit}>Cr</span>
+                </div>
+                <span style={styles.hint}>
+                  {volumeRupees
+                    ? `= \u20b9${volumeRupees.toLocaleString("en-IN")}`
+                    : "In crores: 6 = 6 Cr, 0.6 = 60 Lac, 0.06 = 6 Lac"}
+                </span>
+              </>
+            )}
+
+            {useVolume && useCandle && (
+              <select value={combinator} onChange={(e) => setCombinator(e.target.value)}>
+                <option value="AND">AND — both conditions must be true</option>
+                <option value="OR">OR — either condition is enough</option>
+              </select>
+            )}
+
+            <label style={styles.checkboxRow}>
+              <input type="checkbox" checked={useCandle} onChange={(e) => setUseCandle(e.target.checked)} />
+              Current 1-minute candle is green and up at least
+            </label>
+            {useCandle && (
+              <>
+                <div style={styles.unitRow}>
+                  <input
+                    type="number"
+                    step="any"
+                    min="0"
+                    placeholder="e.g. 1.7"
+                    value={candlePct}
+                    onChange={(e) => setCandlePct(e.target.value)}
+                    style={styles.input}
+                  />
+                  <span style={styles.unit}>%</span>
+                </div>
+                <span style={styles.hint}>Only green candles count — a red candle never triggers this condition.</span>
+              </>
+            )}
+
+            <div style={styles.field}>
+              <span style={styles.label}>Valid till (IST, 24-hour, optional)</span>
+              <ValidTillPicker value={validTill} onChange={setValidTill} />
+            </div>
+            <span style={styles.hint}>
+              {validTill
+                ? `Valid till ${validTill} covers the whole minute: it can still trigger at ${validTill}:59 and is held from the next minute.`
+                : "Leave blank to watch until 15:30."}
+              {" "}Checked live from 09:15 on trading days. It stays active on later days until it triggers or you cancel it.
+              If the condition is already true when you save it during market hours, it is placed straight away.
+            </span>
+          </div>
+        )}
 
         <label style={styles.field}>
           <span style={styles.label}>Order type</span>
@@ -207,10 +374,61 @@ export default function PlaceOrderModal({ symbol, defaultReferencePrice, prefill
         {error && <div style={styles.error}>{error}</div>}
 
         <button type="submit" disabled={submitting} style={{ ...styles.submitBtn, background: transactionType === "B" ? "var(--positive)" : "var(--negative)", borderColor: "transparent" }}>
-          {submitting ? "Placing..." : `${transactionType === "B" ? "Buy" : "Sell"} ${symbol}`}
+          {submitLabel}
         </button>
         <button type="button" style={styles.closeBtn} onClick={onClose}>Cancel</button>
       </form>
+    </div>
+  );
+}
+
+// Hours and minutes only — deliberately NOT <input type="time">, which
+// some browsers render with a seconds field (HH:MM:SS). Auto orders use
+// minute precision: "valid till 09:30" means the whole 09:30 minute.
+// Options are limited to the 09:15 - 15:30 window the order is checked in.
+const HOUR_OPTIONS = ["09", "10", "11", "12", "13", "14", "15"];
+
+function minutesForHour(hour) {
+  let first = 0;
+  let last = 59;
+  if (hour === "09") first = 15; // market opens 09:15
+  if (hour === "15") last = 30;  // market closes 15:30
+  return Array.from({ length: last - first + 1 }, (_, i) => String(first + i).padStart(2, "0"));
+}
+
+function ValidTillPicker({ value, onChange }) {
+  const [hour, minute] = value ? value.split(":") : ["", ""];
+
+  function handleHourChange(newHour) {
+    if (!newHour) {
+      onChange("");
+      return;
+    }
+    // Keep the chosen minute if it's still allowed for this hour,
+    // otherwise fall back to the first allowed one.
+    const allowed = minutesForHour(newHour);
+    onChange(`${newHour}:${allowed.includes(minute) ? minute : allowed[0]}`);
+  }
+
+  return (
+    <div style={styles.timeRow}>
+      <select value={hour} onChange={(e) => handleHourChange(e.target.value)} aria-label="Valid till hour">
+        <option value="">--</option>
+        {HOUR_OPTIONS.map((h) => <option key={h} value={h}>{h}</option>)}
+      </select>
+      <span style={styles.timeColon}>:</span>
+      <select
+        value={minute || ""}
+        disabled={!hour}
+        onChange={(e) => onChange(`${hour}:${e.target.value}`)}
+        aria-label="Valid till minute"
+      >
+        {!hour && <option value="">--</option>}
+        {hour && minutesForHour(hour).map((m) => <option key={m} value={m}>{m}</option>)}
+      </select>
+      {value && (
+        <button type="button" style={styles.linkBtn} onClick={() => onChange("")}>Clear</button>
+      )}
     </div>
   );
 }
@@ -259,7 +477,7 @@ const styles = {
   },
   modal: {
     background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10,
-    padding: 20, width: 360, display: "flex", flexDirection: "column", gap: 10,
+    padding: 20, width: 380, display: "flex", flexDirection: "column", gap: 10,
     maxHeight: "90vh", overflowY: "auto",
   },
   title: { fontSize: 15, fontWeight: 600, margin: "0 0 4px 0" },
@@ -275,6 +493,20 @@ const styles = {
     background: "rgba(91,140,255,0.06)", border: "1px solid var(--border)",
     borderRadius: 8, padding: 10,
   },
+  autoBox: {
+    display: "flex", flexDirection: "column", gap: 8,
+    background: "rgba(245,166,35,0.06)", border: "1px solid rgba(245,166,35,0.35)",
+    borderRadius: 8, padding: 12,
+  },
+  autoTitle: { fontSize: 12, fontWeight: 600 },
+  unitRow: { display: "flex", alignItems: "center", gap: 8 },
+  timeRow: { display: "flex", alignItems: "center", gap: 6 },
+  timeColon: { fontSize: 14, color: "var(--text-muted)" },
+  linkBtn: {
+    background: "none", border: "none", color: "var(--focus)", fontSize: 12,
+    padding: "0 0 0 6px", cursor: "pointer",
+  },
+  unit: { fontSize: 12, color: "var(--text-muted)", minWidth: 20 },
   calcRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 },
   hint: { fontSize: 11, color: "var(--text-muted)" },
   smallBtn: { fontSize: 11, padding: "5px 9px" },

@@ -17,10 +17,17 @@ is_first_tick_of_day=True on a fresh process start before 9:16 AM;
 every reconnect after that treats the first tick as a normal baseline-
 setting tick (current behavior when is_first_tick_of_day=False), which
 safely "loses" only the partial current minute, not the whole day.
+
+AUTO TRADE (requirement 10) is evaluated on the same ticks, after the
+screener and user-alert logic — see _process_auto_trade below. It
+places REAL orders, so it is built defensively: it is wrapped so that
+no error inside it can ever stop the tick loop, and the actual broker
+call runs in a worker thread so it never blocks tick processing.
 """
 
 import asyncio
 import json
+import traceback
 import urllib.parse
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
@@ -33,7 +40,10 @@ from app.database import SessionLocal
 from app.models import Instrument, VolumeAverage, ScreenerDailyStat, AlertHistoryEntry, Alert
 from app import ventura_client
 from app import alert_registry
+from app import auto_trade_registry
+from app import auto_trade_service
 from app.alert_engine import evaluate_alert
+from app.auto_trade_engine import CandleState, update_candle, evaluate_auto_order
 from app.live_engine import StockState, parse_tick, process_tick
 
 WS_BASE_URL = "wss://easeapi-ws.venturasecurities.com/v1/easeapi_mktdata"
@@ -49,6 +59,11 @@ MARKET_OPEN_CUTOFF = dtime(9, 16, 0)  # if we connect before this, treat first t
 # of-day logic in this file must use IST explicitly, never bare
 # datetime.now().
 IST = ZoneInfo("Asia/Kolkata")
+
+# Strong references to in-flight auto-order tasks. asyncio only keeps a
+# weak reference to a task, so without this a placement could in theory
+# be garbage-collected halfway through.
+_background_tasks: set = set()
 
 
 def now_ist() -> datetime:
@@ -152,10 +167,11 @@ async def run_engine(limit: int = None, on_alert=None, on_user_alert=None):
     on_user_alert: an optional async callback, called with
     (client_id, dict of alert details) every time a PERSONAL user
     alert fires — delivered ONLY to that specific user, never
-    broadcast. Both callbacks exist rather than importing FastAPI/
-    WebSocket code directly into this module, so the engine can still
-    run standalone (scripts/run_live_engine.py) without a web-server
-    dependency.
+    broadcast. The same callback also carries AUTO-TRADE results
+    (message type "auto_trade") to the order's owner. Both callbacks
+    exist rather than importing FastAPI/WebSocket code directly into
+    this module, so the engine can still run standalone
+    (scripts/run_live_engine.py) without a web-server dependency.
     """
     db = SessionLocal()
     try:
@@ -163,6 +179,24 @@ async def run_engine(limit: int = None, on_alert=None, on_user_alert=None):
         print(f"Loaded {len(states)} stocks into memory.")
 
         alert_registry.load_all(SessionLocal)
+
+        # Auto trade start-up. Each step is isolated so that a problem
+        # here can never stop the screener itself from starting.
+        try:
+            recovered = auto_trade_service.recover_interrupted_orders()
+            if recovered:
+                print(f"[{now_ist()}] Marked {recovered} interrupted auto order(s) as Rejected (unconfirmed).")
+        except Exception as e:
+            print(f"[{now_ist()}] Auto-trade recovery step failed: {e!r}")
+        try:
+            auto_trade_registry.load_all(SessionLocal)
+        except Exception as e:
+            print(f"[{now_ist()}] Could not load auto orders: {e!r}")
+        try:
+            # Blocking (network logins), so run it off the event loop.
+            await asyncio.to_thread(auto_trade_service.prewarm_sessions)
+        except Exception as e:
+            print(f"[{now_ist()}] Auto-trade session pre-warm failed: {e!r}")
 
         token_to_instrument_id = {
             inst.exchange_token: inst.id
@@ -225,7 +259,104 @@ async def _print_heartbeat(states: dict, tick_counter: dict, interval_seconds: i
 
         print(f"[{now_ist()}] Heartbeat: {ticks_since_last} ticks in last {interval_seconds}s, "
               f"{len(live_multiples)}/{len(states)} stocks with live data. "
-              f"Closest to triggering: {top5 if top5 else '(none yet)'}")
+              f"Closest to triggering: {top5 if top5 else '(none yet)'}. "
+              f"Active auto orders: {auto_trade_registry.count()}")
+
+
+def _process_auto_trade(state, tick, candle_states: dict, is_first_tick_of_day: bool, on_user_alert):
+    """
+    Auto-trade step for ONE tick (requirement 10). Synchronous and
+    fast: it only updates the stock's candle tracker, and — if this
+    stock has active auto orders — evaluates them. The slow part (the
+    broker call) is handed to a background task, never awaited here.
+
+    `state` is the stock's StockState AFTER process_tick has already
+    processed this same tick, so state.ltp / latest_volume /
+    volume_at_minute_start are current.
+    """
+    candle = candle_states.get(tick.exchange_token)
+    if candle is None:
+        candle = CandleState()
+        candle_states[tick.exchange_token] = candle
+    minute = tick.timestamp.replace(second=0, microsecond=0)
+    update_candle(candle, minute, tick.ltp, is_first_tick_of_day)
+
+    if not auto_trade_registry.has_orders():
+        return
+    orders = auto_trade_registry.get_orders_for_symbol(state.trading_symbol)
+    if not orders:
+        return
+
+    if state.latest_volume is None or state.volume_at_minute_start is None:
+        return
+    current_minute_volume = state.latest_volume - state.volume_at_minute_start
+    now = now_ist()
+
+    for order_state in orders:
+        result = evaluate_auto_order(
+            order_state,
+            current_minute_volume=current_minute_volume,
+            ltp=state.ltp,
+            candle=candle,
+            tick_time=tick.timestamp,
+            now=now,
+        )
+        if result is None:
+            continue
+
+        # Claim it in memory FIRST, synchronously, before any await:
+        # the very next tick for this stock can't fire it a second time.
+        auto_trade_registry.remove_order(order_state.order_id)
+        print(f"[{now_ist()}] AUTO TRADE TRIGGERED: order {order_state.order_id} "
+              f"{order_state.trading_symbol} for client {order_state.client_id} — {result.details}")
+
+        task = asyncio.create_task(_execute_auto_order_and_notify(order_state, result.details, on_user_alert))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+
+async def _execute_auto_order_and_notify(order_state, trigger_details: str, on_user_alert):
+    """
+    Places the triggered order in a worker thread, then tells the
+    order's owner (and only them) what happened — success or failure.
+    """
+    try:
+        outcome = await asyncio.to_thread(
+            auto_trade_service.execute_auto_order, order_state.order_id, trigger_details
+        )
+    except Exception as e:
+        traceback.print_exc()
+        outcome = {
+            "outcome": "failed",
+            "order_id": order_state.order_id,
+            "client_id": order_state.client_id,
+            "trading_symbol": order_state.trading_symbol,
+            "message": f"Unexpected error while placing the order: {e}",
+            "trigger_details": trigger_details,
+        }
+
+    print(f"[{now_ist()}] AUTO TRADE RESULT: order {order_state.order_id} "
+          f"{order_state.trading_symbol} -> {outcome.get('outcome')} "
+          f"({outcome.get('message')}) broker_order_no={outcome.get('broker_order_no')}")
+
+    if outcome.get("outcome") == "skipped":
+        return  # nothing was sent (e.g. cancelled at the same instant) — nothing to notify
+
+    if on_user_alert:
+        try:
+            await on_user_alert(order_state.client_id, {
+                "type": "auto_trade",
+                "outcome": outcome.get("outcome"),          # "success" | "failed"
+                "order_id": outcome.get("order_id"),
+                "trading_symbol": outcome.get("trading_symbol"),
+                "transaction_type": outcome.get("transaction_type"),
+                "quantity": outcome.get("quantity"),
+                "broker_order_no": outcome.get("broker_order_no"),
+                "message": outcome.get("message"),
+                "trigger_details": outcome.get("trigger_details"),
+            })
+        except Exception as e:
+            print(f"[{now_ist()}] Could not deliver auto-trade notification: {e!r}")
 
 
 async def _connect_and_listen(states, token_to_instrument_id, db, is_startup_before_market_open, seen_tokens_this_run, on_alert=None, on_user_alert=None):
@@ -275,6 +406,12 @@ async def _connect_and_listen(states, token_to_instrument_id, db, is_startup_bef
 
         tick_counter = {"count": 0}
         heartbeat_task = asyncio.create_task(_print_heartbeat(states, tick_counter))
+
+        # Auto-trade candle trackers are per CONNECTION on purpose: after
+        # a reconnect we may have missed ticks, so every stock's first
+        # minute on the new connection is treated as "not observed from
+        # its start" and skipped for auto trade (see auto_trade_engine).
+        candle_states = {}
 
         try:
             async for raw_message in ws:
@@ -378,5 +515,15 @@ async def _connect_and_listen(states, token_to_instrument_id, db, is_startup_bef
                                     "sound_enabled": alert_state.sound_enabled,
                                     "triggered_at": tick.timestamp.isoformat(),
                                 })
+
+                # Auto trade (requirement 10). Wrapped so that NO error in
+                # here can ever kill the tick loop — an earlier bug in the
+                # alert path did exactly that (see handoff Section 6), and
+                # this path is not allowed to repeat it.
+                try:
+                    _process_auto_trade(state, tick, candle_states, is_first_tick_of_day, on_user_alert)
+                except Exception:
+                    print(f"[{now_ist()}] AUTO TRADE evaluation error for {state.trading_symbol}:")
+                    traceback.print_exc()
         finally:
             heartbeat_task.cancel()

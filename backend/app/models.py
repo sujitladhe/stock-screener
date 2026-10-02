@@ -24,7 +24,7 @@ already were, to avoid touching more than this fix needs.
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Column, String, DateTime, Boolean, Integer, Numeric, UniqueConstraint, Date
+from sqlalchemy import Column, String, DateTime, Boolean, Integer, Numeric, UniqueConstraint, Date, Time
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
 
@@ -308,6 +308,28 @@ class Order(Base):
     — these were originally UTC (datetime.utcnow), which is what made
     "Order Placed timing is not Indian time" a real, reported bug
     rather than just a display quirk. Fixed here at the source.
+
+    AUTO-TRADE ORDERS (requirement 10): an auto order is stored in this
+    SAME table (source="auto") rather than a separate one, so the
+    Orders page, cancel flow and status sync all keep working off one
+    list. Its life cycle:
+
+        Active      -> saved, waiting for its condition (nothing has
+                       been sent to the broker yet; broker_order_no is
+                       null). Stays Active across days until it fires
+                       or the user cancels it.
+        Triggering  -> the condition matched; the order is being sent
+                       to the broker right now (a very short-lived,
+                       transient state).
+        Pending / Executed / Rejected -> same meanings as for manual
+                       orders, after the broker answers. A failed
+                       auto-placement ends up as Rejected, with the
+                       reason in broker_message.
+        Cancelled   -> the user cancelled it before it fired.
+
+    All auto_* thresholds are stored in RAW rupees / raw percent (per
+    architecture principle #9 — "crores" scaling only ever happens at
+    the frontend input/display layer).
     """
     __tablename__ = "orders"
 
@@ -333,12 +355,28 @@ class Order(Base):
     stoploss_percentage = Column(Numeric, nullable=True)
     stoploss_value = Column(Numeric, nullable=True)
 
-    broker_order_no = Column(String, nullable=True, index=True)  # null if the broker rejected the submission itself
-    status = Column(String, nullable=False, default="Pending")  # mirrors Ventura's own status strings (Pending/Executed/Cancelled/Rejected/...)
+    broker_order_no = Column(String, nullable=True, index=True)  # null if the broker rejected the submission itself, or an auto order hasn't fired yet
+    status = Column(String, nullable=False, default="Pending")  # mirrors Ventura's own status strings (Pending/Executed/Cancelled/Rejected/...) plus auto-trade's Active/Triggering
     broker_message = Column(String, nullable=True)  # success confirmation OR rejection reason, whichever Ventura sent
 
     placed_at = Column(DateTime, default=now_ist_naive)
     last_status_check_at = Column(DateTime, nullable=True)
+
+    # --- Auto trade (requirement 10) ---
+    # "manual" (the default — every pre-existing row) or "auto".
+    source = Column(String, nullable=False, default="manual", server_default="manual")
+    # Volume value (current-minute volume x LTP) the stock must reach, in RAW RUPEES.
+    auto_volume_threshold = Column(Numeric, nullable=True)
+    # Current 1-minute GREEN candle % change the stock must reach.
+    auto_candle_pct_threshold = Column(Numeric, nullable=True)
+    # "AND" / "OR" — only meaningful when BOTH thresholds above are set.
+    auto_combinator = Column(String, nullable=True)
+    # Optional IST time of day; the order won't trigger after this time on any day.
+    auto_valid_till = Column(Time, nullable=True)
+    # When the condition matched and the order was sent to the broker (IST).
+    triggered_at = Column(DateTime, nullable=True)
+    # Human-readable snapshot of the numbers that fired it (audit trail).
+    trigger_details = Column(String, nullable=True)
 
 
 class Alert(Base):
