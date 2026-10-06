@@ -7,26 +7,29 @@ import Alerts from "./pages/Alerts";
 import Orders from "./pages/Orders";
 import Positions from "./pages/Positions";
 import Settings from "./pages/Settings";
+import Ignored from "./pages/Ignored";  // NEW (0004)
 import ToastStack from "./components/ToastStack";
-import { getCurrentSession, logout } from "./api";
+import { getCurrentSession, logout, getIgnoredStocks } from "./api";
 import { useScreenerSocket } from "./hooks/useScreenerSocket";
 import { useStockColors } from "./hooks/useStockColors";
 import { usePositions } from "./hooks/usePositions";
 import { useSettings } from "./hooks/useSettings";
 import { useDropdownMenu } from "./hooks/useDropdownMenu";
+import { useAutoOrderSymbols } from "./hooks/useAutoOrderSymbols"; // NEW (0004)
 import { showAlertNotification, showBrowserNotification } from "./browserNotify";
 import { playAlertSound } from "./soundAlert";
 import { showToast } from "./toast";
 import { NAV_ICONS, SunIcon, MoonIcon } from "./icons";
 
 const NAV = [
-  ["live", "Live"],
-  ["orders", "Orders"],
-  ["positions", "Positions"],
+  ["live",       "Live"],
+  ["orders",     "Orders"],
+  ["positions",  "Positions"],
   ["watchlists", "Watchlists"],
-  ["alerts", "Alerts"],
-  ["history", "History"],
-  ["settings", "Settings"],
+  ["alerts",     "Alerts"],
+  ["history",    "History"],
+  ["ignored",    "Ignored"],   // NEW (0004)
+  ["settings",   "Settings"],
 ];
 
 function BrandMark() {
@@ -41,21 +44,61 @@ function BrandMark() {
 }
 
 export default function App() {
-  const [clientId, setClientId] = useState(undefined); // undefined = still checking, null = logged out
-  const [view, setView] = useState("live");
+  const [clientId, setClientId]               = useState(undefined);
+  const [view, setView]                       = useState("live");
   const [alertRefreshSignal, setAlertRefreshSignal] = useState(0);
   const [ordersRefreshSignal, setOrdersRefreshSignal] = useState(0);
-  const [autoActiveCount, setAutoActiveCount] = useState(0);
-  const refetchPositionsRef = useRef(null);
+  // autoActiveCount state removed — badge is derived from autoOrderSymbols.size (see below)
+  const refetchPositionsRef                   = useRef(null);
+
+  // NEW (0004) — ignored symbols, kept as a Set in state so the Live table
+  // filters reactively without re-fetching on every tick.
+  const [ignoredSymbols, setIgnoredSymbols]   = useState(new Set());
 
   const { settings, update: updateSettings, toggleTheme } = useSettings();
-  const { open: openAccountMenu, menu: accountMenu } = useDropdownMenu();
+  const { open: openAccountMenu, menu: accountMenu }       = useDropdownMenu();
 
   useEffect(() => {
     getCurrentSession()
       .then((session) => setClientId(session ? session.client_id : null))
       .catch(() => setClientId(null));
   }, []);
+
+  // Load ignored symbols on login and whenever the Ignored page signals a change.
+  const loadIgnored = useCallback(() => {
+    if (!clientId) return;
+    getIgnoredStocks()
+      .then((list) => setIgnoredSymbols(new Set(list.map((i) => i.trading_symbol))))
+      .catch(() => {});
+  }, [clientId]);
+
+  useEffect(() => { loadIgnored(); }, [loadIgnored]);
+
+  // Proactive session keep-alive: calls /auth/me every 20 minutes so the backend
+  // refreshes the Ventura token before it expires, rather than waiting for the user
+  // to navigate to a protected page and discover it has already gone stale.
+  // 20 minutes is well inside Ventura's typical token window and cheap to poll.
+  useEffect(() => {
+    if (!clientId) return;
+    const INTERVAL = 20 * 60 * 1000; // 20 minutes
+    const id = setInterval(async () => {
+      try {
+        const session = await getCurrentSession();
+        if (!session) {
+          // Token could not be refreshed server-side — force the user to log in again
+          // rather than silently failing when they next try to place an order.
+          showToast("Your session has expired. Please log in again.", "error");
+          setClientId(null);
+        }
+      } catch {
+        // Network hiccup — don't log the user out, just try again next interval.
+      }
+    }, INTERVAL);
+    return () => clearInterval(id);
+  }, [clientId]);
+
+  // NEW (0004) — active auto order symbols, used by ScreenerTable and PlaceOrderModal.
+  const { autoOrderSymbols, refetchAutoOrders } = useAutoOrderSymbols(!!clientId);
 
   const handleUserAlert = useCallback((alert) => {
     showAlertNotification(alert);
@@ -65,7 +108,7 @@ export default function App() {
 
   const handleAutoTrade = useCallback((msg) => {
     const side = msg.transaction_type === "B" ? "Buy" : "Sell";
-    const ok = msg.outcome === "success";
+    const ok   = msg.outcome === "success";
     const text = ok
       ? `Auto ${side} order placed: ${msg.quantity} × ${msg.trading_symbol}` +
         (msg.broker_order_no ? ` (order #${msg.broker_order_no})` : "") +
@@ -80,17 +123,21 @@ export default function App() {
     });
     playAlertSound();
     setOrdersRefreshSignal((n) => n + 1);
+    refetchAutoOrders();
 
     if (ok) {
       const refetch = () => refetchPositionsRef.current && refetchPositionsRef.current();
       refetch();
       setTimeout(refetch, 3000);
     }
-  }, []);
+  }, [refetchAutoOrders]);
 
   const { rows, connectionStatus, flashRowId } = useScreenerSocket(!!clientId, handleUserAlert, handleAutoTrade);
-  const { stockColors, refetchStockColors } = useStockColors(!!clientId);
-  const { openPositions, closedPositions, totalOpenPnl, loading: positionsLoading, error: positionsError, refetchPositions } = usePositions(!!clientId);
+  const { stockColors, refetchStockColors }     = useStockColors(!!clientId);
+  const {
+    openPositions, closedPositions, totalOpenPnl,
+    loading: positionsLoading, error: positionsError, refetchPositions,
+  } = usePositions(!!clientId);
   refetchPositionsRef.current = refetchPositions;
 
   async function handleLogout() {
@@ -101,7 +148,6 @@ export default function App() {
   if (clientId === undefined) {
     return <div style={{ padding: 24, color: "var(--muted)" }}>Loading...</div>;
   }
-
   if (!clientId) {
     return (
       <>
@@ -112,19 +158,28 @@ export default function App() {
   }
 
   const badges = {
-    orders: autoActiveCount,
-    positions: openPositions.length,
+    // autoOrderSymbols (from useAutoOrderSymbols) is already in scope and is the same
+    // Set used for "Auto" tags on Live rows — badge and tags are always in sync.
+    // || undefined hides the badge chip when the count is zero.
+    orders:    autoOrderSymbols.size || undefined,
+    positions: openPositions.length  || undefined,
+    ignored:   ignoredSymbols.size   || undefined,
   };
 
   let page;
   if (view === "history") {
-    page = <History stockColors={stockColors} onWatchlistChanged={refetchStockColors} onNavigateWatchlists={() => setView("watchlists")} settings={settings} />;
+    page = <History stockColors={stockColors} />;
   } else if (view === "watchlists") {
     page = <Watchlist onChanged={refetchStockColors} settings={settings} />;
   } else if (view === "alerts") {
     page = <Alerts refreshSignal={alertRefreshSignal} />;
   } else if (view === "orders") {
-    page = <Orders refreshSignal={ordersRefreshSignal} settings={settings} onAutoActiveCountChange={setAutoActiveCount} />;
+    page = (
+      <Orders
+        refreshSignal={ordersRefreshSignal}
+        settings={settings}
+      />
+    );
   } else if (view === "positions") {
     page = (
       <Positions
@@ -138,20 +193,32 @@ export default function App() {
     );
   } else if (view === "settings") {
     page = <Settings settings={settings} onChange={updateSettings} />;
+  } else if (view === "ignored") {
+    // NEW (0004)
+    page = (
+      <Ignored
+        onKeepWatch={loadIgnored}
+      />
+    );
   } else {
     page = (
       <Screener
         rows={rows}
         flashRowId={flashRowId}
         stockColors={stockColors}
+        ignoredSymbols={ignoredSymbols}
+        onIgnore={(symbol) => setIgnoredSymbols((prev) => new Set([...prev, symbol]))}
         onWatchlistChanged={refetchStockColors}
         onNavigateWatchlists={() => setView("watchlists")}
         settings={settings}
+        autoOrderSymbols={autoOrderSymbols}
+        refetchAutoOrders={refetchAutoOrders}
       />
     );
   }
 
-  const dark = settings.theme === "dark" || (settings.theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  const dark = settings.theme === "dark" ||
+    (settings.theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
   const pageTitle = NAV.find(([k]) => k === view)?.[1] || "Live";
 
   return (
@@ -162,7 +229,7 @@ export default function App() {
         </button>
         <nav className="nav">
           {NAV.map(([key, label]) => {
-            const Icon = NAV_ICONS[key];
+            const Icon  = NAV_ICONS[key];
             const badge = badges[key];
             return (
               <button
@@ -174,7 +241,18 @@ export default function App() {
               >
                 <Icon size={20} />
                 <span>{label}</span>
-                {!!badge && <span className="count" title={key === "orders" ? "Auto orders waiting to trigger" : "Open positions"}>{badge}</span>}
+                {!!badge && (
+                  <span
+                    className="count"
+                    title={
+                      key === "orders"   ? "Auto orders waiting to trigger"
+                      : key === "ignored" ? "Stocks ignored today"
+                      : "Open positions"
+                    }
+                  >
+                    {badge}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -185,7 +263,12 @@ export default function App() {
         <header className="topbar">
           <h1>{pageTitle}</h1>
           <span className="chip" title="Live data connection">
-            <i className={`dot${connectionStatus === "connected" ? " on" : ""}`} /><span className="lbl-hide">{connectionStatus === "connected" ? "Connected" : connectionStatus === "reconnecting" ? "Reconnecting" : "Connecting"}</span>
+            <i className={`dot${connectionStatus === "connected" ? " on" : ""}`} />
+            <span className="lbl-hide">
+              {connectionStatus === "connected" ? "Connected"
+                : connectionStatus === "reconnecting" ? "Reconnecting"
+                : "Connecting"}
+            </span>
           </span>
           {openPositions.length > 0 && (
             <button type="button" className="chip" onClick={() => setView("positions")} title="Open positions profit and loss">

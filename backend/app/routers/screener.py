@@ -3,18 +3,10 @@ routers/screener.py — the endpoints the web UI talks to.
 
 GET  /screener/today            — today's screener hits so far.
 GET  /screener/history          — a past day's screener hits, by date.
-GET  /screener/available-dates  — which dates actually have data, so
-                                   the frontend's date picker doesn't
-                                   guess at valid days.
-WS   /ws/screener                — live push for today's hits only.
+GET  /screener/available-dates  — which dates actually have data.
+WS   /ws/screener               — live push for today's hits only.
 
-NOTE on what columns are NOT here yet: your requirements doc also asks
-for "current %", "remaining % to circuit", "circuit price", and "FNO
-or Non-FNO" per stock. We deliberately deferred sourcing that data
-much earlier in this build (Ventura/Angel don't obviously provide
-circuit limits or an F&O flag in what we've pulled so far) — so those
-columns are simply absent from this response for now, not silently
-wrong.
+Updated in 0004: _serialize now includes circuit_pct and candle_pct.
 """
 
 from datetime import date
@@ -31,19 +23,9 @@ router = APIRouter(tags=["screener"])
 
 
 def _identify_client_id_from_cookie(websocket: WebSocket) -> str | None:
-    """
-    Best-effort identification of the connecting user, for targeted
-    alert delivery (see ws_manager.send_to_client). Deliberately does
-    NOT do the auto-relogin dance get_current_session does for HTTP
-    requests — if we can't cleanly identify the user, the connection
-    still proceeds and gets the shared screener feed, just without
-    personal alert delivery, rather than rejecting the connection
-    outright over what might just be an expired/stale cookie.
-    """
     session_token = websocket.cookies.get(settings.session_cookie_name)
     if not session_token:
-        print(f"[screener ws] No session cookie found on WebSocket connect — "
-              f"personal alerts won't be delivered to this connection.")
+        print(f"[screener ws] No session cookie found — personal alerts won't be delivered.")
         return None
 
     db = SessionLocal()
@@ -53,8 +35,7 @@ def _identify_client_id_from_cookie(websocket: WebSocket) -> str | None:
         if client_id:
             print(f"[screener ws] Identified connecting user as client_id={client_id}")
         else:
-            print(f"[screener ws] Session cookie present but no matching active UserSession found — "
-                  f"personal alerts won't be delivered to this connection.")
+            print(f"[screener ws] No matching active session — personal alerts won't be delivered.")
         return client_id
     finally:
         db.close()
@@ -73,6 +54,9 @@ def _serialize(row: ScreenerDailyStat) -> dict:
         "avg_volume_per_min": float(row.last_avg_volume_per_min),
         "prev_close": float(row.last_prev_close) if row.last_prev_close is not None else None,
         "condition_matched": row.last_condition_matched,
+        # New in 0004 — may be None for rows written before the migration
+        "circuit_pct": row.last_circuit_pct,
+        "candle_pct": float(row.last_candle_pct) if row.last_candle_pct is not None else None,
     }
 
 
@@ -85,7 +69,7 @@ def _query_for_date(db: Session, trade_date: date, search: str = None):
 
 @router.get("/screener/today")
 def get_today_screener(
-    search: str = Query(default=None, description="Filter by trading symbol, case-insensitive substring match"),
+    search: str = Query(default=None),
     db: Session = Depends(get_db),
 ):
     rows = _query_for_date(db, date.today(), search)
@@ -94,7 +78,7 @@ def get_today_screener(
 
 @router.get("/screener/history")
 def get_history_screener(
-    date_str: str = Query(alias="date", description="YYYY-MM-DD"),
+    date_str: str = Query(alias="date"),
     search: str = Query(default=None),
     db: Session = Depends(get_db),
 ):
@@ -112,11 +96,6 @@ def get_history_screener(
 
 @router.get("/screener/available-dates")
 def get_available_dates(db: Session = Depends(get_db)):
-    """
-    Returns every distinct date that has at least one screener hit,
-    most recent first — so the frontend's date picker only ever shows
-    days that actually have data, instead of guessing.
-    """
     results = (
         db.query(ScreenerDailyStat.trade_date)
         .distinct()
@@ -132,9 +111,6 @@ async def websocket_screener(websocket: WebSocket):
     await manager.connect(websocket, client_id=client_id)
     try:
         while True:
-            # We don't expect the browser to send anything meaningful —
-            # this just keeps the connection open and lets us detect
-            # a disconnect (the receive raises WebSocketDisconnect).
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)

@@ -1,22 +1,12 @@
 """
 routers/watchlist.py — per-user watchlist management.
 
-Redesigned per explicit product decisions:
-  - The "first leg / second leg" per-stock concept is REMOVED entirely.
-  - Coloring now happens at the WATCHLIST level: each watchlist has one
-    color, applied to every stock inside it.
-  - A stock may belong to only ONE watchlist per user at a time. Adding
-    it to a different watchlist automatically removes it from wherever
-    it was before.
+Change in 0004: added DELETE /watchlists/{id}/stocks/all to remove every
+stock from a watchlist without deleting the watchlist itself.
 
-Endpoints:
-  GET    /watchlists                  - list my watchlists, each with its stocks
-  POST   /watchlists                  - create a new watchlist (name + color)
-  DELETE /watchlists/{id}             - delete a watchlist (and its stocks)
-  POST   /watchlists/{id}/stocks      - add a stock (auto-removes it from any other watchlist first)
-  DELETE /watchlists/{id}/stocks/{stock_id} - remove a stock from a watchlist
-  GET    /watchlists/stock-colors     - {trading_symbol: color} for ALL my watchlists combined,
-                                         used by the screener to color rows
+IMPORTANT: the /stocks/all route MUST be registered before /{stock_id}
+for the same reason the /history routes in alerts.py come first — Starlette
+matches by registration order and "all" is otherwise a valid {stock_id} value.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -123,10 +113,6 @@ def add_stock(
     if not instrument:
         raise HTTPException(status_code=404, detail=f"Unknown or inactive symbol: {req.trading_symbol}")
 
-    # A stock may only be in ONE watchlist per user — if it's already
-    # in a different one (or even this same one), remove that entry
-    # first. This is the application-level enforcement; the DB's
-    # unique constraint on (client_id, instrument_id) is the backstop.
     existing_anywhere = (
         db.query(WatchlistStock)
         .filter_by(client_id=session.client_id, instrument_id=instrument.id)
@@ -138,7 +124,7 @@ def add_stock(
             return {"id": existing_anywhere.id, "trading_symbol": existing_anywhere.trading_symbol, "status": "already_in_watchlist"}
         moved_from = existing_anywhere.watchlist_id
         db.delete(existing_anywhere)
-        db.flush()  # ensure the delete is applied before the insert, given the unique constraint
+        db.flush()
 
     stock = WatchlistStock(
         watchlist_id=wl.id,
@@ -157,6 +143,22 @@ def add_stock(
     }
 
 
+# IMPORTANT: this /stocks/all route MUST come before /{watchlist_id}/stocks/{stock_id}
+# so that "all" is not treated as a stock_id integer (it would cause a 422, not a 404,
+# but the router would still match /{stock_id} first).
+@router.delete("/{watchlist_id}/stocks/all")
+def clear_all_stocks(
+    watchlist_id: int,
+    db: Session = Depends(get_db),
+    session: UserSession = Depends(get_current_session),
+):
+    """Removes every stock from a watchlist without deleting the watchlist itself."""
+    wl = _get_owned_watchlist(db, watchlist_id, session.client_id)
+    deleted = db.query(WatchlistStock).filter_by(watchlist_id=wl.id).delete()
+    db.commit()
+    return {"status": "cleared", "removed": deleted}
+
+
 @router.delete("/{watchlist_id}/stocks/{stock_id}")
 def remove_stock(
     watchlist_id: int,
@@ -164,7 +166,7 @@ def remove_stock(
     db: Session = Depends(get_db),
     session: UserSession = Depends(get_current_session),
 ):
-    _get_owned_watchlist(db, watchlist_id, session.client_id)  # ownership check
+    _get_owned_watchlist(db, watchlist_id, session.client_id)
     stock = db.query(WatchlistStock).filter_by(id=stock_id, watchlist_id=watchlist_id).first()
     if not stock:
         raise HTTPException(status_code=404, detail="Stock not found in this watchlist.")
@@ -179,12 +181,6 @@ def get_stock_colors(
     db: Session = Depends(get_db),
     session: UserSession = Depends(get_current_session),
 ):
-    """
-    Returns {trading_symbol: color} across ALL of the current user's
-    watchlists — the screener uses this single lookup to tint rows.
-    Since a stock can only be in one watchlist at a time now (unlike
-    the old leg system), there's no ambiguity about which color wins.
-    """
     rows = (
         db.query(WatchlistStock.trading_symbol, Watchlist.color)
         .join(Watchlist, WatchlistStock.watchlist_id == Watchlist.id)

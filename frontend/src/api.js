@@ -1,64 +1,7 @@
-// api.js — centralizes the backend base URL and fetch calls so it's
-// defined once, not scattered across components.
+// api.js — centralizes the backend base URL and fetch calls.
 
 const API_BASE = import.meta.env.VITE_API_BASE || window.location.origin;
 const WS_BASE = API_BASE.replace(/^http/, "ws");
-
-export async function login(credentials) {
-  const res = await fetch(`${API_BASE}/auth/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include", // send/receive the session cookie
-    body: JSON.stringify(credentials),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail || "Login failed");
-  }
-  return res.json();
-}
-
-export async function logout() {
-  await fetch(`${API_BASE}/auth/logout`, {
-    method: "POST",
-    credentials: "include",
-  });
-}
-
-export async function getCurrentSession() {
-  const res = await fetch(`${API_BASE}/auth/me`, { credentials: "include" });
-  if (!res.ok) return null;
-  return res.json();
-}
-
-export async function getTodayScreener(search) {
-  const url = new URL(`${API_BASE}/screener/today`);
-  if (search) url.searchParams.set("search", search);
-  const res = await fetch(url, { credentials: "include" });
-  if (!res.ok) throw new Error("Failed to load screener data");
-  return res.json();
-}
-
-export async function getScreenerHistory(dateStr, search) {
-  const url = new URL(`${API_BASE}/screener/history`);
-  url.searchParams.set("date", dateStr);
-  if (search) url.searchParams.set("search", search);
-  const res = await fetch(url, { credentials: "include" });
-  if (!res.ok) throw new Error("Failed to load screener history");
-  return res.json();
-}
-
-export async function getAvailableDates() {
-  const res = await fetch(`${API_BASE}/screener/available-dates`, { credentials: "include" });
-  if (!res.ok) throw new Error("Failed to load available dates");
-  return res.json();
-}
-
-export function openScreenerSocket() {
-  return new WebSocket(`${WS_BASE}/ws/screener`);
-}
-
-// --- Watchlists ---
 
 async function handleJson(res, fallbackMsg) {
   if (!res.ok) {
@@ -67,6 +10,89 @@ async function handleJson(res, fallbackMsg) {
   }
   return res.json();
 }
+
+// --- Auth ---
+
+export async function login(credentials) {
+  const res = await fetch(`${API_BASE}/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(credentials),
+  });
+  return handleJson(res, "Login failed");
+}
+
+export async function logout() {
+  await fetch(`${API_BASE}/auth/logout`, { method: "POST", credentials: "include" });
+}
+
+export async function getCurrentSession() {
+  const res = await fetch(`${API_BASE}/auth/me`, { credentials: "include" });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+// --- Screener ---
+
+export async function getTodayScreener(search) {
+  const url = new URL(`${API_BASE}/screener/today`);
+  if (search) url.searchParams.set("search", search);
+  const res = await fetch(url, { credentials: "include" });
+  return handleJson(res, "Failed to load screener data");
+}
+
+export async function getScreenerHistory(dateStr, search) {
+  const url = new URL(`${API_BASE}/screener/history`);
+  url.searchParams.set("date", dateStr);
+  if (search) url.searchParams.set("search", search);
+  const res = await fetch(url, { credentials: "include" });
+  return handleJson(res, "Failed to load screener history");
+}
+
+export async function getAvailableDates() {
+  const res = await fetch(`${API_BASE}/screener/available-dates`, { credentials: "include" });
+  return handleJson(res, "Failed to load available dates");
+}
+
+export function openScreenerSocket() {
+  return new WebSocket(`${WS_BASE}/ws/screener`);
+}
+
+// --- Ignored stocks (new in 0004) ---
+
+export async function getIgnoredStocks() {
+  const res = await fetch(`${API_BASE}/screener/ignored`, { credentials: "include" });
+  return handleJson(res, "Failed to load ignored stocks");
+}
+
+export async function ignoreStock(tradingSymbol) {
+  const res = await fetch(`${API_BASE}/screener/ignored`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ trading_symbol: tradingSymbol }),
+  });
+  return handleJson(res, "Failed to ignore stock");
+}
+
+export async function unignoreStock(tradingSymbol) {
+  const res = await fetch(
+    `${API_BASE}/screener/ignored/${encodeURIComponent(tradingSymbol)}`,
+    { method: "DELETE", credentials: "include" },
+  );
+  return handleJson(res, "Failed to unignore stock");
+}
+
+export async function clearIgnoredStocks() {
+  const res = await fetch(`${API_BASE}/screener/ignored`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  return handleJson(res, "Failed to clear ignored list");
+}
+
+// --- Watchlists ---
 
 export async function getWatchlists() {
   const res = await fetch(`${API_BASE}/watchlists`, { credentials: "include" });
@@ -89,6 +115,14 @@ export async function deleteWatchlist(watchlistId) {
     credentials: "include",
   });
   return handleJson(res, "Failed to delete watchlist");
+}
+
+export async function clearWatchlistStocks(watchlistId) {
+  const res = await fetch(`${API_BASE}/watchlists/${watchlistId}/stocks/all`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  return handleJson(res, "Failed to remove all stocks");
 }
 
 export async function addStockToWatchlist(watchlistId, tradingSymbol) {
@@ -164,7 +198,6 @@ export async function clearAlertHistory() {
 
 // --- Orders ---
 
-// source: "manual" | "auto" | "all" -- drives the Orders page dropdown.
 export async function getOrders(source = "all") {
   const url = new URL(`${API_BASE}/orders`);
   url.searchParams.set("source", source);
@@ -182,8 +215,6 @@ export async function placeOrder(payload) {
   return handleJson(res, "Failed to place order");
 }
 
-// Saves an AUTO order: the server places it later, by itself, once its
-// volume / green-candle condition is met (requirement 10).
 export async function createAutoOrder(payload) {
   const res = await fetch(`${API_BASE}/orders/auto`, {
     method: "POST",
@@ -194,11 +225,6 @@ export async function createAutoOrder(payload) {
   return handleJson(res, "Failed to create auto order");
 }
 
-// Edits a still-ACTIVE auto order in place (nothing has been sent to
-// the broker yet, so this rewrites the saved order and its trigger
-// conditions -- same id, same placed_at). Only valid while the order
-// is still Active; once it's fired this 404s and the normal /modify
-// endpoint (for a broker-side Pending order) takes over instead.
 export async function updateAutoOrder(orderId, payload) {
   const res = await fetch(`${API_BASE}/orders/${orderId}/auto`, {
     method: "PATCH",

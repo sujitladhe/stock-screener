@@ -1,56 +1,22 @@
 """
 auto_trade_engine.py — pure decision logic for AUTO TRADE orders
 (requirement 10). No network, no database, no asyncio: like
-live_engine.py and alert_engine.py, it's kept pure on purpose so it can
-be unit tested with synthetic ticks (scripts/test_auto_trade_engine.py)
-before it ever drives a real order. It is also deliberately separate
-from live_engine.py, so nothing here can affect the already-verified
-screener.
+live_engine.py and alert_engine.py, kept pure so it can be unit tested
+with synthetic ticks before it ever drives a real order.
 
-WHAT AN AUTO ORDER WATCHES (per the product decision)
------------------------------------------------------
-  * volume value  = current-minute volume x LTP, compared with the
-                    user's threshold with ">=" (RAW RUPEES here — the
-                    "6 means 6 Cr" scaling is a frontend-only concern).
-                    Same definition of "value" as the screener/alerts.
-  * candle %      = (LTP - candle_open) / candle_open x 100 for the
-                    CURRENT 1-minute candle, compared with ">=".
-                    GREEN ONLY: the candle must have LTP > open. A red
-                    candle never satisfies the candle condition, no
-                    matter how large its % move or whether the volume
-                    condition is met.
-  * Either condition alone, or both combined with AND / OR.
+New in 0004:
+  AutoOrderState.day_high_pct_limit — optional upper cap on the stock's
+    intraday % gain. If the stock is already up >= this % for the day when
+    the engine evaluates the order, evaluation is skipped and the order stays
+    Active. Once the stock pulls back below the cap (or if it never reached
+    it), evaluation resumes normally. This is a LIVE check, not a one-time
+    gate: the order can still fire later in the same session if the condition
+    becomes true and the stock's gain has fallen back under the cap.
 
-  This is a LEVEL check ("is the condition true right now"), not a
-  crossing check like alerts — an auto order fires the first time it
-  sees its condition true inside its allowed window. It is one-shot:
-  the caller removes it from the registry the moment it fires.
-
-WHEN IT MAY FIRE
-----------------
-  * Only on trading weekdays, from 09:15:00 until 15:30:00 IST.
-    (Holidays are handled outside: the engine simply isn't running.)
-  * If the user set "valid till HH:MM" (minutes only, no seconds), the
-    order stays valid for that WHOLE minute and is held from the next
-    one: "valid till 09:30" can still fire at 09:30:59, and is held
-    from 09:31:00. The order is NOT cancelled after that — it simply
-    stops firing for that day and is checked again the next trading
-    day (see auto_trade_registry / the Orders page).
-  * Only on a tick stamped with today's date (a replayed stale tick
-    from a previous session must never fire an order).
-
-DATA-QUALITY GUARD (important — this places real orders)
---------------------------------------------------------
-A candle's OPEN price and the current-minute volume baseline are only
-trustworthy if we watched this stock from the START of the minute. If
-the engine (re)connected in the middle of a minute, both would be
-wrong (the "open" would be whatever tick happened to arrive first, and
-the volume baseline could span the outage). So a minute we did not
-observe from its beginning is SKIPPED for auto trade — for both
-conditions — and the next full minute is used. The one exception is a
-genuine pre-open startup (is_first_tick_of_day), mirroring how the
-screener itself treats that case: there the day's first tick IS the
-start of the minute.
+  evaluate_auto_order now accepts prev_close (keyword-only) so the day-high
+    check can be computed. Callers that don't have prev_close simply omit the
+    argument; the check is then skipped silently (not a bug — prev_close is
+    always available from StockState.prev_close in practice).
 """
 
 from dataclasses import dataclass
@@ -62,10 +28,6 @@ MARKET_CLOSE = dtime(15, 30, 0)
 
 ONE_CRORE = 10_000_000
 
-# Floating-point safety: (101.7 - 100) / 100 * 100 is 1.7000000000000028
-# or 1.6999999999999886 depending on the numbers, and a user who types
-# 1.7 expects "exactly 1.7%" to count. 1e-9 percent is far below
-# anything meaningful in a price.
 CANDLE_PCT_EPSILON = 1e-9
 
 
@@ -79,24 +41,22 @@ class AutoOrderState:
     client_id: str
     trading_symbol: str
 
-    volume_threshold: Optional[float] = None       # raw rupees; None = volume condition not used
-    candle_pct_threshold: Optional[float] = None   # percent;    None = candle condition not used
-    combinator: Optional[str] = None               # "AND"/"OR"; only meaningful if BOTH are set
-    valid_till: Optional[dtime] = None             # IST HH:MM; valid through the end of that minute; None = until market close
+    volume_threshold: Optional[float] = None
+    candle_pct_threshold: Optional[float] = None
+    combinator: Optional[str] = None
+    valid_till: Optional[dtime] = None
+
+    # NEW (0004): if set, the order won't fire while the stock's intraday
+    # gain (ltp vs prev_close) is >= this value. It can still fire once the
+    # stock pulls back below the limit.
+    day_high_pct_limit: Optional[float] = None
 
 
 @dataclass
 class CandleState:
-    """
-    Tracks the CURRENT 1-minute candle of one stock, built from ticks.
-
-    Ventura's tick carries the DAY's open, not the minute's, so the
-    minute's open is taken as the first LTP seen within that minute.
-    """
+    """Tracks the CURRENT 1-minute candle of one stock, built from ticks."""
     minute: Optional[datetime] = None
     open_price: Optional[float] = None
-    # True only if we watched this minute from its very first tick (see
-    # module docstring). Auto orders are not evaluated while False.
     observed_from_start: bool = False
 
 
@@ -105,7 +65,7 @@ class AutoTriggerResult:
     """What evaluate_auto_order returns when an order should fire."""
     volume_value: float
     candle_pct: Optional[float]
-    details: str  # human-readable audit snapshot, stored on the order
+    details: str
 
 
 def update_candle(
@@ -114,17 +74,6 @@ def update_candle(
     ltp: float,
     is_first_tick_of_day: bool = False,
 ) -> None:
-    """
-    Feeds one tick into a stock's candle tracker. tick_minute is the
-    tick's timestamp truncated to the minute (seconds=0).
-
-    - First tick ever seen (this connection): the candle's start is
-      only trusted if this is a genuine pre-open startup.
-    - A LATER minute than the one being tracked: a new candle begins,
-      and we saw its first tick — trusted.
-    - Same minute, or an older/out-of-order minute: nothing changes
-      (an old tick must never rewind the candle).
-    """
     if candle.minute is None:
         candle.minute = tick_minute
         candle.open_price = ltp
@@ -136,19 +85,12 @@ def update_candle(
 
 
 def is_within_trading_window(now: datetime, valid_till: Optional[dtime]) -> bool:
-    """
-    now: current IST wall-clock time (aware or naive — only its
-    weekday/time-of-day are used, so it MUST already be in IST).
-    """
-    if now.weekday() >= 5:  # Saturday / Sunday
+    if now.weekday() >= 5:
         return False
     t = now.time()
     if t < MARKET_OPEN or t >= MARKET_CLOSE:
         return False
     if valid_till is not None:
-        # "Valid till HH:MM" covers that WHOLE minute: compare at minute
-        # precision, so 09:30 is still valid at 09:30:59 and the order
-        # is held as soon as 09:31:00 starts.
         if t.replace(second=0, microsecond=0) > valid_till.replace(second=0, microsecond=0):
             return False
     return True
@@ -162,21 +104,19 @@ def evaluate_auto_order(
     candle: CandleState,
     tick_time: datetime,
     now: datetime,
+    prev_close: Optional[float] = None,  # NEW (0004)
 ) -> Optional[AutoTriggerResult]:
     """
-    Decides whether one auto order should fire on the tick just
-    processed. Returns an AutoTriggerResult if so, else None. Never
-    raises for a malformed order — it returns None instead, because an
-    exception here would otherwise propagate into the live tick loop.
+    Decides whether one auto order should fire on the tick just processed.
+    Returns AutoTriggerResult if so, else None. Never raises — returns None
+    on any invalid/missing data so the tick loop is never disrupted.
     """
-    # Never act on a tick from a previous day (e.g. a replayed snapshot).
     if tick_time.date() != now.date():
         return None
 
     if not is_within_trading_window(now, order.valid_till):
         return None
 
-    # Data-quality guard: see module docstring.
     if not candle.observed_from_start:
         return None
     if candle.open_price is None or candle.open_price <= 0:
@@ -185,7 +125,15 @@ def evaluate_auto_order(
         return None
 
     if order.volume_threshold is None and order.candle_pct_threshold is None:
-        return None  # nothing to evaluate — treat as inert
+        return None
+
+    # NEW (0004) — day-high cap check. If the stock is already up >= the limit
+    # for the day, skip this tick. We'll try again on the next tick — the order
+    # stays Active; this is not a one-time check.
+    if order.day_high_pct_limit is not None and prev_close is not None and prev_close > 0:
+        day_change_pct = (ltp - prev_close) / prev_close * 100
+        if day_change_pct >= order.day_high_pct_limit:
+            return None
 
     volume_value = current_minute_volume * ltp
 
@@ -205,8 +153,6 @@ def evaluate_auto_order(
     elif order.combinator == "OR":
         fired = any(active_checks)
     else:
-        # "AND" — and also the safe default if the combinator is ever
-        # missing/garbled: the stricter reading can only under-fire.
         fired = all(active_checks)
 
     if not fired:

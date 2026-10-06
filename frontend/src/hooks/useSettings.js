@@ -3,10 +3,14 @@ import { useCallback, useEffect, useState } from "react";
 const STORAGE_KEY = "screener_settings_v1";
 
 const DEFAULTS = {
-  theme: "system", // "light" | "dark" | "system"
+  theme: "system",
   riskEnabled: false,
-  riskAmount: null, // rupees the user is willing to risk per trade
-  riskPct: null, // default stoploss %, used to derive risk-per-share
+  riskAmount: null,
+  riskPct: null,
+  // NEW (0004): minimum candle % for the green-candle highlight on Live rows.
+  // A row whose current-minute candle is green AND >= this % gets a tinted background.
+  // Set to null to disable the highlight entirely.
+  greenCandleThreshold: 1.5,
 };
 
 function load() {
@@ -20,12 +24,9 @@ function load() {
 function save(settings) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-  } catch {
-    /* storage unavailable -- setting just won't persist this session */
-  }
+  } catch { /* storage unavailable */ }
 }
 
-/** Applies the effective theme to <html data-theme="..."> immediately, before React even renders, so there's no flash back to the OS theme. Exported separately so main.jsx can call it at boot. */
 export function applyThemeAttr(settings) {
   const root = document.documentElement;
   if (settings.theme === "light") root.dataset.theme = "light";
@@ -33,13 +34,6 @@ export function applyThemeAttr(settings) {
   else delete root.dataset.theme;
 }
 
-/**
- * Settings the user set once and expects Screener to remember:
- *  - theme: explicit Light/Dark always wins and is remembered; "system"
- *    (the default until they pick one) follows the OS.
- *  - risk-based order sizing: used by PlaceOrderModal to prefill a new
- *    order's quantity from (risk amount) / (price * stoploss% / 100).
- */
 export function useSettings() {
   const [settings, setSettings] = useState(load);
 
@@ -55,9 +49,6 @@ export function useSettings() {
     });
   }, []);
 
-  // Clicking the sun/moon toggle always picks an explicit Light or
-  // Dark (never "system") and remembers it -- "Match device" in
-  // Settings is the only way back to following the OS.
   const toggleTheme = useCallback(() => {
     const dark = document.documentElement.dataset.theme
       ? document.documentElement.dataset.theme === "dark"

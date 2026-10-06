@@ -185,6 +185,18 @@ details.pastorders>summary .chev{transition:transform .15s;flex:none}
 details.pastorders[open]>summary{border-bottom:1px solid var(--line);color:var(--text)}
 details.pastorders[open]>summary .chev{transform:rotate(180deg)}
 
+/* ------------------------------------------------------------------ given by claude to add as a patch for green candle %
+
+/* NEW (0004) — green-candle highlight on Live rows.
+   Flash (marigold) takes priority via class order on the <tr>. */
+.tbl tbody tr.row-green {
+  background: var(--up-soft);
+}
+.tbl tbody tr.row-green:hover {
+  background: color-mix(in srgb, var(--up-soft) 80%, var(--hover));
+}
+
+
 /* ------------------------------------------------------------------ Toolbar / search */
 .toolbar{display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap}
 .ss{position:relative;flex:1;min-width:220px;max-width:340px}

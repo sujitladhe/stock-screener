@@ -1,10 +1,7 @@
 import { useState, useEffect } from "react";
 import {
-  getWatchlists,
-  createWatchlist,
-  deleteWatchlist,
-  addStockToWatchlist,
-  removeStockFromWatchlist,
+  getWatchlists, createWatchlist, deleteWatchlist,
+  addStockToWatchlist, removeStockFromWatchlist, clearWatchlistStocks,
 } from "../api";
 import StockSearchInput from "../components/StockSearchInput";
 import PlaceOrderModal from "../components/PlaceOrderModal";
@@ -15,23 +12,29 @@ import { ChartIcon, DownIcon } from "../icons";
 const COLOR_CHOICES = ["#f5c400", "#3dd68c", "#5b8cff", "#ff6b5b", "#c084fc", "#f5a623"];
 
 function openTradingViewChart(symbol) {
-  const url = `https://www.tradingview.com/chart/?symbol=NSE:${encodeURIComponent(symbol)}`;
-  window.open(url, "_blank", "noopener,noreferrer");
+  window.open(
+    `https://www.tradingview.com/chart/?symbol=NSE:${encodeURIComponent(symbol)}`,
+    "_blank",
+    "noopener,noreferrer",
+  );
 }
 
 export default function Watchlist({ onChanged, settings }) {
-  const [lists, setLists] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [newName, setNewName] = useState("");
+  const [lists, setLists]       = useState([]);
+  const [loading, setLoading]   = useState(true);
+  const [error, setError]       = useState(null);
+  const [newName, setNewName]   = useState("");
   const [newColor, setNewColor] = useState(COLOR_CHOICES[0]);
   const [collapsed, setCollapsed] = useState(new Set());
   const [buySymbol, setBuySymbol] = useState(null);
-  const [confirm, confirmDialog] = useConfirm();
+  const [confirm, confirmDialog]  = useConfirm();
 
   function reload() {
     setLoading(true);
-    getWatchlists().then(setLists).catch((err) => setError(err.message)).finally(() => setLoading(false));
+    getWatchlists()
+      .then(setLists)
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false));
   }
   useEffect(reload, []);
 
@@ -50,7 +53,7 @@ export default function Watchlist({ onChanged, settings }) {
     try {
       await createWatchlist(name, newColor);
       setNewName("");
-      showToast(`Watchlist “${name}” created.`);
+      showToast(`Watchlist "${name}" created.`);
       reload();
     } catch (err) {
       showToast(err.message, "error");
@@ -61,14 +64,37 @@ export default function Watchlist({ onChanged, settings }) {
   async function handleDelete(list) {
     const ok = await confirm(
       "Delete this watchlist?",
-      `“${list.name}” and its ${list.stocks.length} stock${list.stocks.length === 1 ? "" : "s"} will be removed. The stocks themselves aren't affected.`,
+      `"${list.name}" and its ${list.stocks.length} stock${list.stocks.length === 1 ? "" : "s"} will be removed.`,
       "Delete list",
-      true
+      true,
     );
     if (!ok) return;
     await deleteWatchlist(list.id);
     reload();
     if (onChanged) onChanged();
+  }
+
+  // NEW (0004) — Remove all stocks without deleting the watchlist
+  async function handleClearStocks(list) {
+    if (list.stocks.length === 0) {
+      showToast("This watchlist has no stocks to remove.");
+      return;
+    }
+    const ok = await confirm(
+      `Remove all ${list.stocks.length} stocks from "${list.name}"?`,
+      "The watchlist itself stays. The stocks themselves aren't affected.",
+      "Remove all stocks",
+      true,
+    );
+    if (!ok) return;
+    try {
+      await clearWatchlistStocks(list.id);
+      showToast(`All stocks removed from "${list.name}".`);
+      reload();
+      if (onChanged) onChanged();
+    } catch (err) {
+      showToast(err.message, "error");
+    }
   }
 
   async function handleAddStock(listId, symbol) {
@@ -94,7 +120,14 @@ export default function Watchlist({ onChanged, settings }) {
           <span>Colour</span>
           <div className="swatches" role="group" aria-label="Watchlist colour">
             {COLOR_CHOICES.map((c) => (
-              <button type="button" key={c} className={`swatch${c === newColor ? " active" : ""}`} style={{ "--c": c }} onClick={() => setNewColor(c)} aria-label={`Colour ${c}`} />
+              <button
+                type="button"
+                key={c}
+                className={`swatch${c === newColor ? " active" : ""}`}
+                style={{ "--c": c }}
+                onClick={() => setNewColor(c)}
+                aria-label={`Colour ${c}`}
+              />
             ))}
           </div>
         </div>
@@ -106,7 +139,10 @@ export default function Watchlist({ onChanged, settings }) {
       {loading ? (
         <p className="muted small">Loading...</p>
       ) : lists.length === 0 ? (
-        <div className="panel empty"><b>No watchlists yet.</b>Create one above. Stocks in a watchlist get its colour on the Live screen.</div>
+        <div className="panel empty">
+          <b>No watchlists yet.</b>
+          Create one above. Stocks in a watchlist get its colour on the Live screen.
+        </div>
       ) : (
         <div className="stack">
           {lists.map((l) => {
@@ -114,23 +150,51 @@ export default function Watchlist({ onChanged, settings }) {
             return (
               <section key={l.id} className="panel wl" style={{ "--c": l.color }}>
                 <div className="wl-head">
-                  <button type="button" className="icon-btn" onClick={() => toggleCollapsed(l.id)} aria-label={isCollapsed ? `Expand ${l.name}` : `Collapse ${l.name}`} aria-expanded={!isCollapsed} style={{ transform: isCollapsed ? "rotate(-90deg)" : "none" }}>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={() => toggleCollapsed(l.id)}
+                    aria-label={isCollapsed ? `Expand ${l.name}` : `Collapse ${l.name}`}
+                    aria-expanded={!isCollapsed}
+                    style={{ transform: isCollapsed ? "rotate(-90deg)" : "none" }}
+                  >
                     <DownIcon size={18} />
                   </button>
                   <h2>{l.name}</h2>
                   <span className="muted">{l.stocks.length} {l.stocks.length === 1 ? "stock" : "stocks"}</span>
                   <div className="grow" />
+                  {/* NEW (0004) — Remove all stocks */}
+                  {l.stocks.length > 0 && (
+                    <button
+                      type="button"
+                      className="btn sm danger"
+                      onClick={() => handleClearStocks(l)}
+                      title={`Remove all stocks from ${l.name}`}
+                    >
+                      Remove all stocks
+                    </button>
+                  )}
                   <button type="button" className="btn sm danger" onClick={() => handleDelete(l)}>Delete list</button>
                 </div>
                 {!isCollapsed && (
                   <div className="wl-body">
-                    <StockSearchInput placeholder="Add a stock: search by symbol or name" onSelect={(symbol) => handleAddStock(l.id, symbol)} />
+                    <StockSearchInput
+                      placeholder="Add a stock: search by symbol or name"
+                      onSelect={(symbol) => handleAddStock(l.id, symbol)}
+                    />
                     {l.stocks.length === 0 ? (
                       <p className="muted small" style={{ padding: "6px 0" }}>No stocks yet. Search above to add one.</p>
                     ) : (
                       l.stocks.map((s) => (
                         <div className="wl-row" key={s.id}>
-                          <button type="button" className="icon-btn" style={{ flex: "none" }} onClick={() => openTradingViewChart(s.trading_symbol)} title={`Open ${s.trading_symbol} on TradingView`} aria-label={`Open ${s.trading_symbol} chart on TradingView`}>
+                          <button
+                            type="button"
+                            className="icon-btn"
+                            style={{ flex: "none" }}
+                            onClick={() => openTradingViewChart(s.trading_symbol)}
+                            title={`Open ${s.trading_symbol} on TradingView`}
+                            aria-label={`Open ${s.trading_symbol} chart on TradingView`}
+                          >
                             <ChartIcon />
                           </button>
                           <span className="sym">{s.trading_symbol}</span>

@@ -1,28 +1,14 @@
 """
-ws_client.py — connects live_engine.py's tested decision logic to
-Ventura's real WebSocket feed. This is the "plumbing" layer; all the
-actual decision-making lives in live_engine.py and is already unit
-tested against synthetic data.
+ws_client.py — connects live_engine.py to Ventura's real WebSocket feed.
 
-Auto-reconnect (per requirement 11a): if the connection drops, this
-reconnects automatically with a short backoff, rather than requiring
-anyone to manually restart the process.
-
-IMPORTANT reconnect nuance: when we reconnect mid-day, the first tick
-we see for each stock must NOT be treated as "first tick of the day"
-(see live_engine.process_tick's is_first_tick_of_day parameter) — if
-it were, we'd wrongly treat the stock's entire day-so-far cumulative
-volume as "this minute" and fire a false massive alert. We only pass
-is_first_tick_of_day=True on a fresh process start before 9:16 AM;
-every reconnect after that treats the first tick as a normal baseline-
-setting tick (current behavior when is_first_tick_of_day=False), which
-safely "loses" only the partial current minute, not the whole day.
-
-AUTO TRADE (requirement 10) is evaluated on the same ticks, after the
-screener and user-alert logic — see _process_auto_trade below. It
-places REAL orders, so it is built defensively: it is wrapped so that
-no error inside it can ever stop the tick loop, and the actual broker
-call runs in a worker thread so it never blocks tick processing.
+Changes in 0004:
+  - save_alert() now accepts candle_pct and circuit_pct; returns (count, is_new).
+  - When a stock fires for the first time today (is_new), its circuit % is
+    fetched from Ventura's OHLCV API in a worker thread and stored in the row.
+  - The screener broadcast payload now includes candle_pct and circuit_pct.
+  - expire_daily_auto_orders() is called on engine start so "today only" orders
+    from previous trading days are cancelled before loading the registry.
+  - evaluate_auto_order() is called with prev_close so day_high_pct_limit works.
 """
 
 import asyncio
@@ -49,20 +35,10 @@ from app.live_engine import StockState, parse_tick, process_tick
 WS_BASE_URL = "wss://easeapi-ws.venturasecurities.com/v1/easeapi_mktdata"
 
 RECONNECT_DELAY_SECONDS = 5
-MARKET_OPEN_CUTOFF = dtime(9, 16, 0)  # if we connect before this, treat first ticks as day-start
+MARKET_OPEN_CUTOFF = dtime(9, 16, 0)
 
-# CRITICAL: don't trust the server's system clock to be IST — a real
-# test run caught this being wrong (EC2 defaults to UTC), which caused
-# EVERY stock's first tick to be wrongly treated as "day start,"
-# reading the stock's entire volume-so-far as "this one minute" and
-# firing massive false alerts within seconds of connecting. All time-
-# of-day logic in this file must use IST explicitly, never bare
-# datetime.now().
 IST = ZoneInfo("Asia/Kolkata")
 
-# Strong references to in-flight auto-order tasks. asyncio only keeps a
-# weak reference to a task, so without this a placement could in theory
-# be garbage-collected halfway through.
 _background_tasks: set = set()
 
 
@@ -71,12 +47,6 @@ def now_ist() -> datetime:
 
 
 def load_stock_states(db: Session, limit: int | None = None) -> dict:
-    """
-    Loads every active, mapped NSE/EQ instrument WITH a computed
-    average into memory as a StockState, keyed by exchange_token —
-    this is the in-memory lookup table the architecture doc calls for,
-    avoiding a DB query per tick.
-    """
     query = (
         db.query(Instrument, VolumeAverage)
         .join(VolumeAverage, VolumeAverage.instrument_id == Instrument.id)
@@ -99,28 +69,26 @@ def load_stock_states(db: Session, limit: int | None = None) -> dict:
     return states
 
 
-def save_alert(db: Session, alert, instrument_id: int):
+def save_alert(
+    db: Session,
+    alert,
+    instrument_id: int,
+    candle_pct: float | None = None,
+    circuit_pct: int | None = None,
+) -> tuple[int, bool]:
     """
-    Upserts into screener_daily_stats: if this stock already has a row
-    for today, increments occurrence_count and updates the "last"
-    snapshot fields. Otherwise creates the first row for the day with
-    occurrence_count=1. This is what keeps the table's size bounded —
-    a stock triggering 20 times in one session is still just ONE row,
-    not 20.
-
-    Per an explicit product decision: individual occurrences are NOT
-    logged one-per-row here (that would grow the table unboundedly) —
-    the live browser feed shows every occurrence as it happens (an
-    in-memory, frontend-only concern), but a page refresh only ever
-    shows this row's latest snapshot, by design.
+    Upserts the screener daily stat row.
+    Returns (occurrence_count, is_new_today).
+    is_new_today is True only for the very first alert for this stock today —
+    the caller uses this to decide whether to fetch circuit limits from Ventura.
     """
     trade_date = alert.triggered_at.date()
-
     existing = (
         db.query(ScreenerDailyStat)
         .filter_by(instrument_id=instrument_id, trade_date=trade_date)
         .first()
     )
+    is_new = existing is None
 
     if existing:
         existing.occurrence_count += 1
@@ -132,6 +100,10 @@ def save_alert(db: Session, alert, instrument_id: int):
         existing.last_ltp = alert.ltp
         existing.last_prev_close = alert.prev_close
         existing.last_condition_matched = alert.condition_matched
+        existing.last_candle_pct = candle_pct
+        # Only overwrite circuit_pct if we actually fetched a new value.
+        if circuit_pct is not None:
+            existing.last_circuit_pct = circuit_pct
         occurrence_count = existing.occurrence_count
     else:
         occurrence_count = 1
@@ -149,30 +121,28 @@ def save_alert(db: Session, alert, instrument_id: int):
             last_ltp=alert.ltp,
             last_prev_close=alert.prev_close,
             last_condition_matched=alert.condition_matched,
+            last_candle_pct=candle_pct,
+            last_circuit_pct=circuit_pct,
         ))
 
     db.commit()
-    return occurrence_count
+    # return occurrence_count, is_new
+    return occurrence_count, is_new, (existing.last_circuit_pct if existing else None)
+
+
+def _update_circuit_pct_in_db(db: Session, instrument_id: int, trade_date, circuit_pct: int) -> None:
+    """Stores a freshly-fetched circuit % on the row created seconds ago by save_alert."""
+    try:
+        db.query(ScreenerDailyStat).filter_by(
+            instrument_id=instrument_id, trade_date=trade_date
+        ).update({"last_circuit_pct": circuit_pct})
+        db.commit()
+    except Exception as e:
+        print(f"[ws_client] Could not persist circuit_pct={circuit_pct}: {e}")
+        db.rollback()
 
 
 async def run_engine(limit: int = None, on_alert=None, on_user_alert=None):
-    """
-    Main entry point: loads state, connects, processes ticks forever,
-    reconnecting automatically on any disconnect.
-
-    on_alert: an optional async callback, called with a dict of
-    SCREENER alert details every time one fires — broadcast to every
-    connected browser (shared feed).
-
-    on_user_alert: an optional async callback, called with
-    (client_id, dict of alert details) every time a PERSONAL user
-    alert fires — delivered ONLY to that specific user, never
-    broadcast. The same callback also carries AUTO-TRADE results
-    (message type "auto_trade") to the order's owner. Both callbacks
-    exist rather than importing FastAPI/WebSocket code directly into
-    this module, so the engine can still run standalone
-    (scripts/run_live_engine.py) without a web-server dependency.
-    """
     db = SessionLocal()
     try:
         states = load_stock_states(db, limit=limit)
@@ -180,20 +150,27 @@ async def run_engine(limit: int = None, on_alert=None, on_user_alert=None):
 
         alert_registry.load_all(SessionLocal)
 
-        # Auto trade start-up. Each step is isolated so that a problem
-        # here can never stop the screener itself from starting.
+        # --- Auto trade startup sequence ---
         try:
             recovered = auto_trade_service.recover_interrupted_orders()
             if recovered:
-                print(f"[{now_ist()}] Marked {recovered} interrupted auto order(s) as Rejected (unconfirmed).")
+                print(f"[{now_ist()}] Marked {recovered} interrupted auto order(s) as Rejected.")
         except Exception as e:
             print(f"[{now_ist()}] Auto-trade recovery step failed: {e!r}")
+
+        # NEW (0004): expire "today only" orders from previous trading days.
+        try:
+            expired = auto_trade_service.expire_daily_auto_orders()
+            if expired:
+                print(f"[{now_ist()}] Expired {expired} today-only auto order(s) from previous days.")
+        except Exception as e:
+            print(f"[{now_ist()}] Auto-trade daily expiry step failed: {e!r}")
+
         try:
             auto_trade_registry.load_all(SessionLocal)
         except Exception as e:
             print(f"[{now_ist()}] Could not load auto orders: {e!r}")
         try:
-            # Blocking (network logins), so run it off the event loop.
             await asyncio.to_thread(auto_trade_service.prewarm_sessions)
         except Exception as e:
             print(f"[{now_ist()}] Auto-trade session pre-warm failed: {e!r}")
@@ -204,9 +181,9 @@ async def run_engine(limit: int = None, on_alert=None, on_user_alert=None):
         }
 
         is_startup_before_market_open = now_ist().time() < MARKET_OPEN_CUTOFF
-        seen_tokens_this_run = set()  # tracks which stocks we've received at least one tick for, THIS process run
+        seen_tokens_this_run = set()
 
-        while True:  # reconnect loop
+        while True:
             try:
                 await _connect_and_listen(
                     states, token_to_instrument_id, db,
@@ -217,34 +194,17 @@ async def run_engine(limit: int = None, on_alert=None, on_user_alert=None):
             except (websockets.exceptions.ConnectionClosed, ConnectionError, OSError) as e:
                 print(f"[{now_ist()}] Connection lost ({e}). Reconnecting in {RECONNECT_DELAY_SECONDS}s...")
                 await asyncio.sleep(RECONNECT_DELAY_SECONDS)
-            # After the FIRST connection attempt, a reconnect should never treat a
-            # stock's first-seen tick as day-start, even if the process itself
-            # started before market open — seen_tokens_this_run already prevents
-            # this correctly (a token only gets the day-start treatment once, on
-            # its true first tick of the whole run).
     finally:
         db.close()
 
 
 async def _print_heartbeat(states: dict, tick_counter: dict, interval_seconds: int = 60):
-    """
-    Runs alongside the tick loop and periodically prints proof of life
-    — total ticks received, and the stocks currently closest to
-    triggering (by current-minute multiple of their average). This
-    exists specifically so "no alerts yet" can be told apart from
-    "silently not receiving any data" — a real gap noticed when a
-    200-stock, 10-minute test produced no alerts and no way to tell
-    which of those two situations it actually was.
-    """
     while True:
         await asyncio.sleep(interval_seconds)
 
         ticks_since_last = tick_counter["count"]
         tick_counter["count"] = 0
 
-        # Compute each tracked stock's current-minute multiple, for
-        # any stock that has at least started a minute (current_minute
-        # is set once the first tick arrives).
         live_multiples = []
         for state in states.values():
             if state.current_minute is None or state.latest_volume is None or state.volume_at_minute_start is None:
@@ -264,16 +224,6 @@ async def _print_heartbeat(states: dict, tick_counter: dict, interval_seconds: i
 
 
 def _process_auto_trade(state, tick, candle_states: dict, is_first_tick_of_day: bool, on_user_alert):
-    """
-    Auto-trade step for ONE tick (requirement 10). Synchronous and
-    fast: it only updates the stock's candle tracker, and — if this
-    stock has active auto orders — evaluates them. The slow part (the
-    broker call) is handed to a background task, never awaited here.
-
-    `state` is the stock's StockState AFTER process_tick has already
-    processed this same tick, so state.ltp / latest_volume /
-    volume_at_minute_start are current.
-    """
     candle = candle_states.get(tick.exchange_token)
     if candle is None:
         candle = CandleState()
@@ -300,12 +250,11 @@ def _process_auto_trade(state, tick, candle_states: dict, is_first_tick_of_day: 
             candle=candle,
             tick_time=tick.timestamp,
             now=now,
+            prev_close=state.prev_close,  # NEW (0004) — enables day_high_pct_limit check
         )
         if result is None:
             continue
 
-        # Claim it in memory FIRST, synchronously, before any await:
-        # the very next tick for this stock can't fire it a second time.
         auto_trade_registry.remove_order(order_state.order_id)
         print(f"[{now_ist()}] AUTO TRADE TRIGGERED: order {order_state.order_id} "
               f"{order_state.trading_symbol} for client {order_state.client_id} — {result.details}")
@@ -316,10 +265,6 @@ def _process_auto_trade(state, tick, candle_states: dict, is_first_tick_of_day: 
 
 
 async def _execute_auto_order_and_notify(order_state, trigger_details: str, on_user_alert):
-    """
-    Places the triggered order in a worker thread, then tells the
-    order's owner (and only them) what happened — success or failure.
-    """
     try:
         outcome = await asyncio.to_thread(
             auto_trade_service.execute_auto_order, order_state.order_id, trigger_details
@@ -337,16 +282,16 @@ async def _execute_auto_order_and_notify(order_state, trigger_details: str, on_u
 
     print(f"[{now_ist()}] AUTO TRADE RESULT: order {order_state.order_id} "
           f"{order_state.trading_symbol} -> {outcome.get('outcome')} "
-          f"({outcome.get('message')}) broker_order_no={outcome.get('broker_order_no')}")
+          f"broker_order_no={outcome.get('broker_order_no')}")
 
     if outcome.get("outcome") == "skipped":
-        return  # nothing was sent (e.g. cancelled at the same instant) — nothing to notify
+        return
 
     if on_user_alert:
         try:
             await on_user_alert(order_state.client_id, {
                 "type": "auto_trade",
-                "outcome": outcome.get("outcome"),          # "success" | "failed"
+                "outcome": outcome.get("outcome"),
                 "order_id": outcome.get("order_id"),
                 "trading_symbol": outcome.get("trading_symbol"),
                 "transaction_type": outcome.get("transaction_type"),
@@ -359,7 +304,11 @@ async def _execute_auto_order_and_notify(order_state, trigger_details: str, on_u
             print(f"[{now_ist()}] Could not deliver auto-trade notification: {e!r}")
 
 
-async def _connect_and_listen(states, token_to_instrument_id, db, is_startup_before_market_open, seen_tokens_this_run, on_alert=None, on_user_alert=None):
+async def _connect_and_listen(
+    states, token_to_instrument_id, db,
+    is_startup_before_market_open, seen_tokens_this_run,
+    on_alert=None, on_user_alert=None,
+):
     token_data = ventura_client.login(
         app_key=settings.ventura_service_app_key,
         app_secret=settings.ventura_service_app_secret,
@@ -380,18 +329,6 @@ async def _connect_and_listen(states, token_to_instrument_id, db, is_startup_bef
     async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
         print(f"[{now_ist()}] Connected. Subscribing to {len(states)} stocks in batches...")
 
-        # A real full-scale test confirmed Ventura's WebSocket rejects
-        # (or the connection dies from) a single subscribe message
-        # listing all ~2,655 tokens at once — it disconnected ~280ms
-        # after every such attempt, consistently, which points to a
-        # real undocumented limit rather than random network flakiness.
-        # 200 tokens in one message was confirmed working in an earlier
-        # test, so we batch conservatively below that, with a short
-        # pause between batches, and log progress so a failure at some
-        # cumulative count (rather than per-batch) is visible — that
-        # would point to a total per-connection cap instead of a
-        # per-message one, which would need a different fix (multiple
-        # connections, as we did for Angel One).
         all_tokens = list(states.keys())
         batch_size = 150
         for i in range(0, len(all_tokens), batch_size):
@@ -407,10 +344,8 @@ async def _connect_and_listen(states, token_to_instrument_id, db, is_startup_bef
         tick_counter = {"count": 0}
         heartbeat_task = asyncio.create_task(_print_heartbeat(states, tick_counter))
 
-        # Auto-trade candle trackers are per CONNECTION on purpose: after
-        # a reconnect we may have missed ticks, so every stock's first
-        # minute on the new connection is treated as "not observed from
-        # its start" and skipped for auto trade (see auto_trade_engine).
+        # Per-connection candle states for auto trade (and now candle_pct broadcast).
+        # Reset on reconnect so mid-minute candles aren't trusted.
         candle_states = {}
 
         try:
@@ -428,7 +363,7 @@ async def _connect_and_listen(states, token_to_instrument_id, db, is_startup_bef
 
                 state = states.get(tick.exchange_token)
                 if state is None:
-                    continue  # a tick for a token we don't track (shouldn't normally happen)
+                    continue
 
                 is_first_tick_of_day = (
                     is_startup_before_market_open
@@ -437,17 +372,70 @@ async def _connect_and_listen(states, token_to_instrument_id, db, is_startup_bef
                 seen_tokens_this_run.add(tick.exchange_token)
 
                 alert = process_tick(state, tick, is_first_tick_of_day=is_first_tick_of_day)
+
                 if alert:
                     instrument_id = token_to_instrument_id.get(tick.exchange_token)
-                    print(f"[{now_ist()}] ALERT: {alert.trading_symbol} — {alert.condition_matched} "
-                          f"— {alert.multiple}x avg, value Rs.{alert.value:,.0f}, LTP {alert.ltp}")
+
+                    # --- Compute current-minute candle % (green candles only). ---
+                    # We use the same candle_states dict that auto trade maintains.
+                    # update_candle hasn't been called for this tick yet (that happens
+                    # in _process_auto_trade below), so we look at the LAST completed
+                    # state. For the very first tick in a minute the open equals LTP,
+                    # giving 0% — acceptable; the tag appears from the second tick onward.
+                    candle = candle_states.get(tick.exchange_token)
+                    candle_pct = None
+                    if (
+                        candle
+                        and candle.open_price
+                        and candle.open_price > 0
+                        and candle.observed_from_start
+                        and tick.ltp > candle.open_price
+                    ):
+                        candle_pct = round(
+                            (tick.ltp - candle.open_price) / candle.open_price * 100, 2
+                        )
+
                     if instrument_id:
-                        occurrence_count = save_alert(db, alert, instrument_id)
+                        # occurrence_count, is_new = save_alert(
+                        #     db, alert, instrument_id,
+                        #     candle_pct=candle_pct,
+                        #     circuit_pct=None,  # filled in asynchronously below if is_new
+                        # )
+                        occurrence_count, is_new, circuit_pct = save_alert(
+                            db, alert, instrument_id, 
+                            candle_pct=candle_pct
+                        )
+
+
+                        # Fetch circuit limits from Ventura for the first occurrence today.
+                        # Run in a worker thread so the tick loop isn't blocked by the HTTP call.
+                        # circuit_pct = None
+                        if is_new and tick.prev_close and tick.prev_close > 0:
+                            try:
+                                circuit_pct = await asyncio.to_thread(
+                                    ventura_client.fetch_circuit_pct,
+                                    tick.exchange_token,
+                                    tick.prev_close,
+                                    settings.ventura_service_app_key,
+                                    settings.ventura_service_client_id,
+                                    auth_token,
+                                )
+                                if circuit_pct is not None:
+                                    _update_circuit_pct_in_db(
+                                        db, instrument_id,
+                                        alert.triggered_at.date(),
+                                        circuit_pct,
+                                    )
+                            except Exception as e:
+                                print(f"[{now_ist()}] Circuit fetch failed for "
+                                      f"{alert.trading_symbol}: {e}")
+
+                        print(f"[{now_ist()}] ALERT: {alert.trading_symbol} — "
+                              f"{alert.condition_matched} — {alert.multiple}x avg, "
+                              f"value Rs.{alert.value:,.0f}, LTP {alert.ltp}, "
+                              f"candle_pct={candle_pct}, circuit_pct={circuit_pct}")
+
                         if on_alert:
-                            # Field names deliberately match GET /screener/today's
-                            # response shape exactly (e.g. "last_triggered_at", not
-                            # "triggered_at") — a real bug was caught where a mismatch
-                            # here caused the frontend to lose fields on a live update.
                             await on_alert({
                                 "trading_symbol": alert.trading_symbol,
                                 "ltp": alert.ltp,
@@ -459,29 +447,41 @@ async def _connect_and_listen(states, token_to_instrument_id, db, is_startup_bef
                                 "condition_matched": alert.condition_matched,
                                 "occurrence_count": occurrence_count,
                                 "last_triggered_at": alert.triggered_at.isoformat(),
+                                # NEW (0004)
+                                "candle_pct": candle_pct,
+                                "circuit_pct": circuit_pct,
                             })
 
-                # User-defined alerts (requirement 9) — checked independently
-                # of the screener's own conditions, using the SAME already-
-                # updated state (state.ltp is current as of this tick).
-                # NOTE: only stocks with a computed average are in `states`
-                # at all (see load_stock_states) — a stock listed too
-                # recently to have one yet won't be checked here. Given
-                # averages run weekly across the whole universe, this only
-                # affects a handful of brand-new listings, not a general gap.
+                # --- User-defined alerts (requirement 9) ---
                 alerts_for_symbol = alert_registry.get_alerts_for_symbol(state.trading_symbol)
                 if alerts_for_symbol:
-                    current_minute_volume = state.latest_volume - state.volume_at_minute_start
+                    current_minute_volume = (
+                        (state.latest_volume or 0) - (state.volume_at_minute_start or 0)
+                    )
                     current_value = current_minute_volume * state.ltp
                     for alert_state in alerts_for_symbol:
-                        fired = evaluate_alert(alert_state, current_price=state.ltp, current_value=current_value)
+                        fired = evaluate_alert(
+                            alert_state,
+                            current_price=state.ltp,
+                            current_value=current_value,
+                        )
                         if fired:
-                            summary_parts = [f"{alert_state.condition_1_metric} {alert_state.condition_1_operator} {alert_state.condition_1_threshold}"]
+                            summary_parts = [
+                                f"{alert_state.condition_1_metric} "
+                                f"{alert_state.condition_1_operator} "
+                                f"{alert_state.condition_1_threshold}"
+                            ]
                             if alert_state.condition_2_metric:
-                                summary_parts.append(f"{alert_state.combinator} {alert_state.condition_2_metric} {alert_state.condition_2_operator} {alert_state.condition_2_threshold}")
+                                summary_parts.append(
+                                    f"{alert_state.combinator} "
+                                    f"{alert_state.condition_2_metric} "
+                                    f"{alert_state.condition_2_operator} "
+                                    f"{alert_state.condition_2_threshold}"
+                                )
                             condition_summary = " ".join(summary_parts)
 
-                            print(f"[{now_ist()}] USER ALERT fired: {state.trading_symbol} for client {alert_state.client_id} — {condition_summary}")
+                            print(f"[{now_ist()}] USER ALERT fired: "
+                                  f"{state.trading_symbol} for client {alert_state.client_id}")
 
                             db.add(AlertHistoryEntry(
                                 alert_id=alert_state.alert_id,
@@ -493,12 +493,6 @@ async def _connect_and_listen(states, token_to_instrument_id, db, is_startup_bef
                                 condition_summary=condition_summary,
                             ))
 
-                            # One-shot alerts, per an explicit product decision: once
-                            # fired, deactivate permanently — both in the DB (so it
-                            # shows as inactive/"fired" in the UI) and in the live
-                            # in-memory registry (so it stops being checked on
-                            # subsequent ticks immediately, not just after the next
-                            # engine restart).
                             alert_row = db.query(Alert).filter_by(id=alert_state.alert_id).first()
                             if alert_row:
                                 alert_row.is_active = False
@@ -516,14 +510,14 @@ async def _connect_and_listen(states, token_to_instrument_id, db, is_startup_bef
                                     "triggered_at": tick.timestamp.isoformat(),
                                 })
 
-                # Auto trade (requirement 10). Wrapped so that NO error in
-                # here can ever kill the tick loop — an earlier bug in the
-                # alert path did exactly that (see handoff Section 6), and
-                # this path is not allowed to repeat it.
+                # --- Auto trade (requirement 10) ---
                 try:
-                    _process_auto_trade(state, tick, candle_states, is_first_tick_of_day, on_user_alert)
+                    _process_auto_trade(
+                        state, tick, candle_states, is_first_tick_of_day, on_user_alert
+                    )
                 except Exception:
-                    print(f"[{now_ist()}] AUTO TRADE evaluation error for {state.trading_symbol}:")
+                    print(f"[{now_ist()}] AUTO TRADE evaluation error for "
+                          f"{state.trading_symbol}:")
                     traceback.print_exc()
         finally:
             heartbeat_task.cancel()

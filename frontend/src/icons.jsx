@@ -1,6 +1,4 @@
-// icons.jsx — small, dependency-free icon set (feather-style outline
-// icons) shared across the app. Kept as plain components rather than
-// pulling in an icon package, since only a dozen or so are needed.
+// icons.jsx — small, dependency-free icon set (feather-style outline icons).
 
 function Icon({ children, size = 18, filled = false, ...rest }) {
   return (
@@ -41,6 +39,16 @@ export const MoonIcon = (p) => <Icon {...p}><path d="M21 12.8A9 9 0 1111.2 3a7 7
 export const DownIcon = (p) => <Icon {...p}><path d="M6 9l6 6 6-6" /></Icon>;
 export const BookmarkIcon = (p) => <Icon size={16} {...p}><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" /></Icon>;
 
+// NEW (0004) — used for the "Ignore for today" action on a screener row.
+// Also used as the nav icon for the Ignored page.
+export const EyeOffIcon = (p) => (
+  <Icon size={16} {...p}>
+    <path d="M17.9 17.9A10 10 0 0112 19C7 19 2.7 15.8 1 12c.8-2 2.3-3.8 4.1-5.1M9.9 4.2A10 10 0 0112 4c5 0 9.3 3.2 11 7.9a10 10 0 01-1.9 3.4" />
+    <path d="M14.1 14.1A3 3 0 019.9 9.9" />
+    <path d="M3 3l18 18" />
+  </Icon>
+);
+
 export const NAV_ICONS = {
   live: LiveIcon,
   orders: OrdersIcon,
@@ -48,5 +56,6 @@ export const NAV_ICONS = {
   watchlists: WatchlistsIcon,
   alerts: AlertsIcon,
   history: HistoryIcon,
+  ignored: EyeOffIcon,
   settings: SettingsIcon,
 };
