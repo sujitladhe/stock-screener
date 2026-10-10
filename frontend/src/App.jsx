@@ -7,19 +7,19 @@ import Alerts from "./pages/Alerts";
 import Orders from "./pages/Orders";
 import Positions from "./pages/Positions";
 import Settings from "./pages/Settings";
-import Ignored from "./pages/Ignored";  // NEW (0004)
+import Ignored from "./pages/Ignored";
 import ToastStack from "./components/ToastStack";
-import { getCurrentSession, logout, getIgnoredStocks } from "./api";
+import { getCurrentSession, logout, getIgnoredStocks, refreshSession } from "./api";
 import { useScreenerSocket } from "./hooks/useScreenerSocket";
 import { useStockColors } from "./hooks/useStockColors";
 import { usePositions } from "./hooks/usePositions";
 import { useSettings } from "./hooks/useSettings";
 import { useDropdownMenu } from "./hooks/useDropdownMenu";
-import { useAutoOrderSymbols } from "./hooks/useAutoOrderSymbols"; // NEW (0004)
+import { useAutoOrderSymbols } from "./hooks/useAutoOrderSymbols";
 import { showAlertNotification, showBrowserNotification } from "./browserNotify";
 import { playAlertSound } from "./soundAlert";
 import { showToast } from "./toast";
-import { NAV_ICONS, SunIcon, MoonIcon } from "./icons";
+import { NAV_ICONS, SunIcon, MoonIcon, RefreshIcon } from "./icons";
 
 const NAV = [
   ["live",       "Live"],
@@ -28,7 +28,7 @@ const NAV = [
   ["watchlists", "Watchlists"],
   ["alerts",     "Alerts"],
   ["history",    "History"],
-  ["ignored",    "Ignored"],   // NEW (0004)
+  ["ignored",    "Ignored"],
   ["settings",   "Settings"],
 ];
 
@@ -44,16 +44,13 @@ function BrandMark() {
 }
 
 export default function App() {
-  const [clientId, setClientId]               = useState(undefined);
-  const [view, setView]                       = useState("live");
+  const [clientId, setClientId]             = useState(undefined);
+  const [view, setView]                     = useState("live");
   const [alertRefreshSignal, setAlertRefreshSignal] = useState(0);
   const [ordersRefreshSignal, setOrdersRefreshSignal] = useState(0);
-  // autoActiveCount state removed — badge is derived from autoOrderSymbols.size (see below)
-  const refetchPositionsRef                   = useRef(null);
-
-  // NEW (0004) — ignored symbols, kept as a Set in state so the Live table
-  // filters reactively without re-fetching on every tick.
-  const [ignoredSymbols, setIgnoredSymbols]   = useState(new Set());
+  const [ignoredSymbols, setIgnoredSymbols] = useState(new Set());
+  const [refreshingSession, setRefreshingSession] = useState(false); // NEW
+  const refetchPositionsRef                 = useRef(null);
 
   const { settings, update: updateSettings, toggleTheme } = useSettings();
   const { open: openAccountMenu, menu: accountMenu }       = useDropdownMenu();
@@ -64,7 +61,6 @@ export default function App() {
       .catch(() => setClientId(null));
   }, []);
 
-  // Load ignored symbols on login and whenever the Ignored page signals a change.
   const loadIgnored = useCallback(() => {
     if (!clientId) return;
     getIgnoredStocks()
@@ -74,30 +70,43 @@ export default function App() {
 
   useEffect(() => { loadIgnored(); }, [loadIgnored]);
 
-  // Proactive session keep-alive: calls /auth/me every 20 minutes so the backend
-  // refreshes the Ventura token before it expires, rather than waiting for the user
-  // to navigate to a protected page and discover it has already gone stale.
-  // 20 minutes is well inside Ventura's typical token window and cheap to poll.
+  // Proactive keep-alive: refresh Ventura token every 20 min so it never
+  // expires mid-session without the user knowing.
   useEffect(() => {
     if (!clientId) return;
-    const INTERVAL = 20 * 60 * 1000; // 20 minutes
+    const INTERVAL = 20 * 60 * 1000;
     const id = setInterval(async () => {
       try {
         const session = await getCurrentSession();
         if (!session) {
-          // Token could not be refreshed server-side — force the user to log in again
-          // rather than silently failing when they next try to place an order.
           showToast("Your session has expired. Please log in again.", "error");
           setClientId(null);
         }
-      } catch {
-        // Network hiccup — don't log the user out, just try again next interval.
-      }
+      } catch { /* network hiccup — try again next interval */ }
     }, INTERVAL);
     return () => clearInterval(id);
   }, [clientId]);
 
-  // NEW (0004) — active auto order symbols, used by ScreenerTable and PlaceOrderModal.
+  // NEW — explicit session refresh triggered by the topbar button.
+  async function handleSessionRefresh() {
+    if (refreshingSession) return;
+    setRefreshingSession(true);
+    try {
+      const result = await refreshSession();
+      if (result.refreshed) {
+        showToast("Re-login done — your Ventura session has been refreshed.", "success");
+      } else {
+        showToast("Already logged in — session is active.", "success");
+      }
+    } catch (err) {
+      // Backend returned 401: re-login failed, force the user to log in manually.
+      showToast(err.message || "Session expired. Please log in again.", "error");
+      setClientId(null);
+    } finally {
+      setRefreshingSession(false);
+    }
+  }
+
   const { autoOrderSymbols, refetchAutoOrders } = useAutoOrderSymbols(!!clientId);
 
   const handleUserAlert = useCallback((alert) => {
@@ -158,9 +167,6 @@ export default function App() {
   }
 
   const badges = {
-    // autoOrderSymbols (from useAutoOrderSymbols) is already in scope and is the same
-    // Set used for "Auto" tags on Live rows — badge and tags are always in sync.
-    // || undefined hides the badge chip when the count is zero.
     orders:    autoOrderSymbols.size || undefined,
     positions: openPositions.length  || undefined,
     ignored:   ignoredSymbols.size   || undefined,
@@ -194,12 +200,7 @@ export default function App() {
   } else if (view === "settings") {
     page = <Settings settings={settings} onChange={updateSettings} />;
   } else if (view === "ignored") {
-    // NEW (0004)
-    page = (
-      <Ignored
-        onKeepWatch={loadIgnored}
-      />
-    );
+    page = <Ignored onKeepWatch={loadIgnored} />;
   } else {
     page = (
       <Screener
@@ -245,7 +246,7 @@ export default function App() {
                   <span
                     className="count"
                     title={
-                      key === "orders"   ? "Auto orders waiting to trigger"
+                      key === "orders"    ? "Auto orders waiting to trigger"
                       : key === "ignored" ? "Stocks ignored today"
                       : "Open positions"
                     }
@@ -262,6 +263,7 @@ export default function App() {
       <div className="main">
         <header className="topbar">
           <h1>{pageTitle}</h1>
+
           <span className="chip" title="Live data connection">
             <i className={`dot${connectionStatus === "connected" ? " on" : ""}`} />
             <span className="lbl-hide">
@@ -270,6 +272,7 @@ export default function App() {
                 : "Connecting"}
             </span>
           </span>
+
           {openPositions.length > 0 && (
             <button type="button" className="chip" onClick={() => setView("positions")} title="Open positions profit and loss">
               <span className="muted lbl-hide">Open P&amp;L</span>
@@ -278,9 +281,31 @@ export default function App() {
               </b>
             </button>
           )}
-          <button type="button" className="icon-btn bordered" onClick={toggleTheme} aria-label={dark ? "Switch to light theme" : "Switch to dark theme"}>
+
+          <button
+            type="button"
+            className="icon-btn bordered"
+            onClick={toggleTheme}
+            aria-label={dark ? "Switch to light theme" : "Switch to dark theme"}
+          >
             {dark ? <SunIcon size={17} /> : <MoonIcon size={17} />}
           </button>
+
+          {/* NEW — session refresh button, sits just before the client-code chip */}
+          <button
+            type="button"
+            className="icon-btn bordered"
+            onClick={handleSessionRefresh}
+            disabled={refreshingSession}
+            title="Check and refresh your Ventura session"
+            aria-label="Refresh Ventura session"
+          >
+            <RefreshIcon
+              size={17}
+              className={refreshingSession ? "spin" : undefined}
+            />
+          </button>
+
           <button
             type="button"
             className="chip"
@@ -290,6 +315,7 @@ export default function App() {
             {clientId}
           </button>
         </header>
+
         <main className="content">{page}</main>
       </div>
 
