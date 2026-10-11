@@ -6,7 +6,7 @@ import PlaceOrderModal from "../components/PlaceOrderModal";
 import ModifyOrderModal from "../components/ModifyOrderModal";
 import StockSearchInput from "../components/StockSearchInput";
 import FilterInput from "../components/FilterInput";
-import { DownIcon } from "../icons";
+import { ChartIcon, DownIcon } from "../icons";
 
 const TERMINAL_STATUSES = new Set(["Executed", "Cancelled", "Rejected"]);
 const REORDERABLE_STATUSES = new Set(["Cancelled", "Rejected"]);
@@ -22,6 +22,11 @@ const STATUS_PILL_CLASS = {
   Active: "p-active", Triggering: "p-trig", Pending: "p-pending",
   Executed: "p-exec", Rejected: "p-rej", Cancelled: "p-can",
 };
+
+function openTradingViewChart(symbol) {
+  const url = `https://www.tradingview.com/chart/?symbol=NSE:${encodeURIComponent(symbol)}`;
+  window.open(url, "_blank", "noopener,noreferrer");
+}
 
 function timeOnly(isoString) {
   const m = /(\d{2}):(\d{2}):(\d{2})/.exec(isoString || "");
@@ -92,11 +97,25 @@ function OrderRow({ o, onCancel, onReorder, onModify }) {
   return (
     <tr>
       <td className="top">
-        <div>
-          <span className="sym">{o.trading_symbol}</span>
-          {auto && <span className="tag-auto">Auto</span>}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button
+            type="button"
+            className="icon-btn"
+            style={{ flex: "none" }}
+            onClick={() => openTradingViewChart(o.trading_symbol)}
+            title={`Open ${o.trading_symbol} on TradingView`}
+            aria-label={`Open ${o.trading_symbol} chart on TradingView`}
+          >
+            <ChartIcon />
+          </button>
+          <div>
+            <div>
+              <span className="sym">{o.trading_symbol}</span>
+              {auto && <span className="tag-auto">Auto</span>}
+            </div>
+            <div className="sub">{auto ? conditionText(o) : (o.order_kind === "delivery" ? "Delivery" : "Intraday")}</div>
+          </div>
         </div>
-        <div className="sub">{auto ? conditionText(o) : (o.order_kind === "delivery" ? "Delivery" : "Intraday")}</div>
       </td>
       <td className="top">
         <span className={`b ${o.transaction_type === "B" ? "up" : "down"}`}>{sideLabel}</span>{" "}
@@ -144,7 +163,7 @@ function OrdersTable({ orders, onCancel, onReorder, onModify }) {
 export default function Orders({ refreshSignal, settings }) {
   const [allOrders, setAllOrders]         = useState([]);
   const [source, setSource]               = useState("all");
-  const [symbolFilter, setSymbolFilter]   = useState(""); // NEW (0004) — text filter by stock name
+  const [symbolFilter, setSymbolFilter]   = useState("");
   const [loading, setLoading]             = useState(true);
   const [error, setError]                 = useState(null);
   const [newOrderSymbol, setNewOrderSymbol]   = useState(null);
@@ -166,10 +185,6 @@ export default function Orders({ refreshSignal, settings }) {
   useEffect(() => { reload(); }, []);
   useEffect(() => { if (!refreshSignal) return; reload({ showSpinner: false }); }, [refreshSignal]);
 
-  // Badge count is now managed in App.jsx via useAutoOrderSymbols — no local tracking needed.
-
-  // Derived from the already-loaded order list — always in sync, no extra fetch needed.
-  // Used to warn (and disable submit) when the user tries to create a duplicate Active auto order.
   const autoOrderSymbols = useMemo(
     () => new Set(allOrders.filter((o) => o.source === "auto" && o.status === "Active").map((o) => o.trading_symbol)),
     [allOrders],
@@ -186,15 +201,10 @@ export default function Orders({ refreshSignal, settings }) {
 
   const today = todayISTDateString();
 
-  // Active / Triggering orders surface permanently at the top of the page regardless
-  // of when they were created. An auto order placed last Tuesday that still hasn't
-  // fired should not be buried inside a collapsed "Earlier orders" section.
   const activeOrders = filtered.filter(
     (o) => o.status === "Active" || o.status === "Triggering",
   );
 
-  // Everything else splits into today vs past by the date it actually reached the broker
-  // (triggered_at for auto, placed_at for manual).
   const nonActive = filtered.filter(
     (o) => o.status !== "Active" && o.status !== "Triggering",
   );
@@ -256,7 +266,6 @@ export default function Orders({ refreshSignal, settings }) {
             <option value="all">All</option>
           </select>
         </label>
-        {/* NEW (0004) — search orders by stock symbol */}
         <FilterInput
           value={symbolFilter}
           onChange={setSymbolFilter}
@@ -274,10 +283,6 @@ export default function Orders({ refreshSignal, settings }) {
         <p className="muted small">Loading...</p>
       ) : (
         <>
-          {/* ── Zone 1: Active / Triggering orders ──────────────────────────
-              Always shown at the very top, regardless of the date they were
-              created. An auto order from last week that hasn't fired yet must
-              be immediately visible so the user can modify or cancel it.     */}
           {activeOrders.length > 0 && (
             <div style={{ marginBottom: 20 }}>
               <h2 className="section-title" style={{ marginTop: 0 }}>
@@ -308,7 +313,6 @@ export default function Orders({ refreshSignal, settings }) {
             </div>
           )}
 
-          {/* ── Zone 2: Today's non-active orders ───────────────────────── */}
           {todays.length > 0 && (
             <div className="panel table-panel" style={{ marginBottom: 16 }}>
               <OrdersTable
@@ -320,19 +324,16 @@ export default function Orders({ refreshSignal, settings }) {
             </div>
           )}
 
-          {/* Empty state — only when all three zones are empty */}
           {activeOrders.length === 0 && todays.length === 0 && past.length === 0 && (
             <div className="panel empty"><b>{emptyMsg[0]}</b>{emptyMsg[1]}</div>
           )}
 
-          {/* No-orders-today note — only when there are past orders to show but nothing today */}
           {activeOrders.length === 0 && todays.length === 0 && past.length > 0 && (
             <p className="muted small" style={{ margin: "4px 0 16px" }}>
               No{symbolFilter ? ` "${symbolFilter.toUpperCase()}"` : ""} orders placed today.
             </p>
           )}
 
-          {/* ── Zone 3: Earlier orders (non-active only) ─────────────────── */}
           {past.length > 0 && (
             <details
               className="pastorders"
