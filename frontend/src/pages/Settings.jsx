@@ -20,9 +20,12 @@ export default function Settings({ settings, onChange }) {
   const [riskAmount, setRiskAmount]   = useState(settings.riskAmount ?? "");
   const [riskPct, setRiskPct]         = useState(settings.riskPct ?? "");
 
-  // NEW (0004) — green candle threshold
+  // Green candle threshold
   const [greenEnabled, setGreenEnabled]     = useState(settings.greenCandleThreshold != null);
   const [greenThreshold, setGreenThreshold] = useState(settings.greenCandleThreshold ?? "1.5");
+
+  // Capital for delivery order sizing
+  const [capital, setCapital] = useState(settings.capital ?? "");
 
   function handleSaveRisk(e) {
     e.preventDefault();
@@ -40,6 +43,15 @@ export default function Settings({ settings, onChange }) {
     onChange({ greenCandleThreshold: threshold });
     showToast("Green candle settings saved.");
   }
+
+  function handleSaveCapital(e) {
+    e.preventDefault();
+    const cap = parseFloat(capital) || null;
+    onChange({ capital: cap });
+    showToast("Capital setting saved.");
+  }
+
+  const capitalNum = parseFloat(capital);
 
   return (
     <div>
@@ -68,7 +80,33 @@ export default function Settings({ settings, onChange }) {
         <button type="submit" className="btn primary" style={{ alignSelf: "flex-start" }}>Save settings</button>
       </form>
 
-      {/* NEW (0004) — green candle highlight on Live */}
+      {/* Capital for delivery order sizing */}
+      <form className="panel alert-form" style={{ maxWidth: 520, margin: "0 0 20px" }} onSubmit={handleSaveCapital}>
+        <h2 style={{ fontSize: 16, fontWeight: 600 }}>Capital for delivery orders</h2>
+        <p className="hint">
+          When you switch to Delivery in an order window, quantity is automatically calculated as
+          your capital divided by the stock's price. You can still edit it before placing the order.
+        </p>
+        <label className="field" style={{ maxWidth: 260 }}>
+          <span>Total capital (₹)</span>
+          <input
+            className="input num"
+            inputMode="decimal"
+            placeholder="e.g. 100000"
+            value={capital}
+            onChange={(e) => setCapital(e.target.value)}
+          />
+        </label>
+        {capitalNum > 0 && (
+          <p className="hint">
+            Example: at ₹100/share → {fmtInt(Math.floor(capitalNum / 100))} shares &nbsp;·&nbsp;
+            at ₹500/share → {fmtInt(Math.floor(capitalNum / 500))} shares.
+          </p>
+        )}
+        <button type="submit" className="btn primary" style={{ alignSelf: "flex-start" }}>Save settings</button>
+      </form>
+
+      {/* Green candle highlight on Live */}
       <form className="panel alert-form" style={{ maxWidth: 520, margin: "0 0 20px" }} onSubmit={handleSaveGreen}>
         <h2 style={{ fontSize: 16, fontWeight: 600 }}>Green candle highlight on Live</h2>
         <p className="hint">

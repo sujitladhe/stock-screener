@@ -11,6 +11,9 @@ const DEFAULTS = {
   // A row whose current-minute candle is green AND >= this % gets a tinted background.
   // Set to null to disable the highlight entirely.
   greenCandleThreshold: 1.5,
+  // NEW: total capital used to auto-size delivery order quantities.
+  // Qty = floor(capital / ltp) when user switches to Delivery in the order drawer.
+  capital: null,
 };
 
 function load() {

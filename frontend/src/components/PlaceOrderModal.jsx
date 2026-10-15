@@ -77,6 +77,7 @@ export default function PlaceOrderModal({
   );
   const [triggerPrice, setTriggerPrice] = useState(prefillOrder?.trigger_price ? String(prefillOrder.trigger_price) : "");
 
+  // Risk-based auto quantity (intraday)
   const autoQty = useMemo(() => {
     if (prefillOrder) return null;
     if (!rs.riskEnabled || !(rs.riskAmount > 0) || !(rs.riskPct > 0) || !(defaultReferencePrice > 0)) return null;
@@ -88,7 +89,12 @@ export default function PlaceOrderModal({
   const [quantity, setQuantity] = useState(
     prefillOrder?.quantity ? String(prefillOrder.quantity) : (autoQty > 0 ? String(autoQty) : ""),
   );
-  const [qtyAutoHintVisible, setQtyAutoHintVisible] = useState(autoQty > 0);
+
+  // qtyHint: string shown under Quantity field; null when user has edited manually.
+  // Shows risk hint initially (if autoQty was applied), or capital hint after switching to delivery.
+  const [qtyHint, setQtyHint] = useState(
+    autoQty > 0 ? "Auto-set from your risk settings. Edit anytime." : null
+  );
 
   const [useStoplossCalc, setUseStoplossCalc] = useState(!!prefillOrder?.stoploss_percentage);
   const [referencePrice, setReferencePrice] = useState(defaultReferencePrice ? String(defaultReferencePrice) : "");
@@ -110,7 +116,7 @@ export default function PlaceOrderModal({
   const [combinator, setCombinator] = useState(prefillOrder?.auto_combinator || "AND");
   const [validTill, setValidTill]   = useState(prefillIsAuto && prefillOrder.auto_valid_till ? prefillOrder.auto_valid_till : "");
 
-  // NEW (0004) — day-high cap and order lifetime
+  // 0004 — day-high cap and order lifetime
   const [dayHighPct, setDayHighPct]       = useState(
     prefillIsAuto && prefillOrder.auto_day_high_pct_limit != null
       ? String(prefillOrder.auto_day_high_pct_limit) : "",
@@ -130,14 +136,30 @@ export default function PlaceOrderModal({
   const sideLabel = transactionType === "B" ? "Buy" : "Sell";
 
   // Check for a duplicate Active auto order on this symbol.
-  // Applies to NEW orders AND reorders — both create a fresh Active order, so both must be
-  // blocked if one already exists. Only genuine edits (!isEdit) are exempt because an edit
-  // updates the SAME order rather than creating another one.
   const hasDuplicateAutoOrder = !isEdit && isAuto && autoOrderSymbols.has(symbol);
+
+  // Capital-based delivery qty: floor(capital / ltp)
+  const capitalQty = useMemo(() => {
+    if (prefillOrder) return null;
+    if (!(rs.capital > 0) || !(defaultReferencePrice > 0)) return null;
+    return Math.floor(rs.capital / defaultReferencePrice);
+  }, [prefillOrder, rs.capital, defaultReferencePrice]);
 
   function handleOrderKindChange(kind) {
     setOrderKind(kind);
     setProduct(kind === "delivery" ? "C" : "I");
+
+    if (!prefillOrder) {
+      if (kind === "delivery" && capitalQty > 0) {
+        // Auto-fill quantity from capital setting
+        setQuantity(String(capitalQty));
+        setQtyHint("Calculated from your capital setting. Edit anytime.");
+      } else if (kind === "intraday" && autoQty > 0) {
+        // Restore risk-based qty when switching back to intraday
+        setQuantity(String(autoQty));
+        setQtyHint("Auto-set from your risk settings. Edit anytime.");
+      }
+    }
   }
 
   const calculatedQuantity = useMemo(() => {
@@ -151,9 +173,9 @@ export default function PlaceOrderModal({
   }, [referencePrice, stoplossPercentage, stoplossValue]);
 
   function applyCalculatedQuantity() {
-    if (calculatedQuantity) { setQuantity(String(calculatedQuantity)); setQtyAutoHintVisible(false); }
+    if (calculatedQuantity) { setQuantity(String(calculatedQuantity)); setQtyHint(null); }
   }
-  function handleQtyChange(v) { setQuantity(v); setQtyAutoHintVisible(false); }
+  function handleQtyChange(v) { setQuantity(v); setQtyHint(null); }
 
   const volumeRupees = useMemo(() => {
     const cr = parseFloat(volumeCr);
@@ -218,8 +240,8 @@ export default function PlaceOrderModal({
         candle_pct_threshold,
         combinator: useVolume && useCandle ? combinator : null,
         valid_till: validTill || null,
-        day_high_pct_limit: parsedDayHighPct,          // NEW (0004)
-        auto_expires_daily: autoExpiresDaily,           // NEW (0004)
+        day_high_pct_limit: parsedDayHighPct,
+        auto_expires_daily: autoExpiresDaily,
       };
     }
 
@@ -291,7 +313,7 @@ export default function PlaceOrderModal({
                 : "Sent to the broker straight away."}
           </p>
 
-          {/* NEW (0004) — duplicate auto order warning */}
+          {/* Duplicate auto order warning */}
           {isAuto && hasDuplicateAutoOrder && (
             <div
               style={{
@@ -347,7 +369,7 @@ export default function PlaceOrderModal({
                 </>
               )}
 
-              {/* NEW (0004) — day-high cap */}
+              {/* Day-high cap */}
               <div className="field">
                 <span>Skip if stock is already up this much today (optional)</span>
                 <div className="unit">
@@ -368,7 +390,7 @@ export default function PlaceOrderModal({
                 </span>
               </div>
 
-              {/* NEW (0004) — order lifetime */}
+              {/* Order lifetime */}
               <div className="field">
                 <span>Order stays active</span>
                 <div className="seg" role="group" aria-label="Order lifetime" style={{ marginTop: 2 }}>
@@ -443,8 +465,8 @@ export default function PlaceOrderModal({
             <label className="field">
               <span>Quantity</span>
               <input className="input num" type="number" value={quantity} onChange={(e) => handleQtyChange(e.target.value)} />
-              {qtyAutoHintVisible && autoQty > 0 && (
-                <span className="hint">Auto-set from your risk settings. Edit anytime.</span>
+              {qtyHint && (
+                <span className="hint">{qtyHint}</span>
               )}
             </label>
             <label className="field">
