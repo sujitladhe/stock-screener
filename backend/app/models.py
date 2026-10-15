@@ -129,6 +129,26 @@ class ScreenerDailyStat(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class ScreenerSettings(Base):
+    """
+    Singleton row (always id=1) holding the two screener conditions.
+    Added in migration 0005. If the table is empty, the engine falls back
+    to the hardcoded defaults in live_engine.py.
+
+    All values stored in human-readable units:
+      - multiplier: integer (e.g. 20 means "20× average volume")
+      - min_value_cr: Crores (e.g. 4 means "₹4 Cr")
+    """
+    __tablename__ = "screener_settings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cond1_multiplier = Column(Integer, nullable=False, default=20)
+    cond1_min_value_cr = Column(Numeric, nullable=False, default=4)
+    cond2_multiplier = Column(Integer, nullable=False, default=10)
+    cond2_min_value_cr = Column(Numeric, nullable=False, default=6)
+    updated_at = Column(DateTime, nullable=True)
+
+
 class Watchlist(Base):
     __tablename__ = "watchlists"
     __table_args__ = (
@@ -201,12 +221,7 @@ class Order(Base):
     trigger_details = Column(String, nullable=True)
 
     # --- Auto trade (0004) ---
-    # True = the order expires at the end of its first trading day (today-only).
-    # False (default) = stays Active across trading days until it fires or is cancelled.
     auto_expires_daily = Column(Boolean, nullable=False, default=False, server_default="false")
-    # Optional upper cap on the stock's intraday % gain. If the stock is already up
-    # this much when the engine evaluates the order, it skips and waits. If the
-    # stock later pulls back below the cap, it resumes checking.
     auto_day_high_pct_limit = Column(Numeric, nullable=True)
 
 
@@ -248,12 +263,6 @@ class AlertHistoryEntry(Base):
 class IgnoredStock(Base):
     """
     Per-user, per-day list of stocks hidden from the Live screener.
-    A stock in this table is suppressed from the user's view even if it keeps
-    meeting the screener condition. The list is purely a display filter on the
-    frontend — the backend broadcasts alerts for all stocks regardless. Rows
-    have no automatic expiry; a nightly job or the daily-reset logic on the
-    frontend treats only today's rows as active.
-
     Added in migration 0004.
     """
     __tablename__ = "ignored_stocks"

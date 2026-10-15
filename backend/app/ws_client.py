@@ -1,14 +1,11 @@
 """
 ws_client.py — connects live_engine.py to Ventura's real WebSocket feed.
 
-Changes in 0004:
-  - save_alert() now accepts candle_pct and circuit_pct; returns (count, is_new).
-  - When a stock fires for the first time today (is_new), its circuit % is
-    fetched from Ventura's OHLCV API in a worker thread and stored in the row.
-  - The screener broadcast payload now includes candle_pct and circuit_pct.
-  - expire_daily_auto_orders() is called on engine start so "today only" orders
-    from previous trading days are cancelled before loading the registry.
-  - evaluate_auto_order() is called with prev_close so day_high_pct_limit works.
+Changes in 0005:
+  - Loads ScreenerConditions from screener_settings DB table at engine start.
+  - Refreshes conditions from DB every 2 minutes so UI changes take effect
+    without restarting the engine.
+  - Passes conditions to process_tick() on every tick.
 """
 
 import asyncio
@@ -23,28 +20,70 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import SessionLocal
-from app.models import Instrument, VolumeAverage, ScreenerDailyStat, AlertHistoryEntry, Alert
+from app.models import Instrument, VolumeAverage, ScreenerDailyStat, AlertHistoryEntry, Alert, ScreenerSettings
 from app import ventura_client
 from app import alert_registry
 from app import auto_trade_registry
 from app import auto_trade_service
 from app.alert_engine import evaluate_alert
 from app.auto_trade_engine import CandleState, update_candle, evaluate_auto_order
-from app.live_engine import StockState, parse_tick, process_tick
+from app.live_engine import StockState, parse_tick, process_tick, ScreenerConditions, ONE_CR
 
 WS_BASE_URL = "wss://easeapi-ws.venturasecurities.com/v1/easeapi_mktdata"
 
 RECONNECT_DELAY_SECONDS = 5
+CONDITIONS_REFRESH_SECONDS = 120   # re-read screener_settings from DB every 2 min
 MARKET_OPEN_CUTOFF = dtime(9, 16, 0)
 
 IST = ZoneInfo("Asia/Kolkata")
 
 _background_tasks: set = set()
 
+# Mutable holder for live screener conditions.
+# Using a list so it can be replaced atomically without locks —
+# everything here runs on one asyncio event loop, no threading.
+_conditions_holder: list = [None]
+
 
 def now_ist() -> datetime:
     return datetime.now(IST)
 
+
+# ---------------------------------------------------------------------------
+# Screener conditions helpers
+# ---------------------------------------------------------------------------
+
+def _load_conditions(db: Session) -> ScreenerConditions:
+    """Reads screener_settings from DB, returns ScreenerConditions (defaults if empty)."""
+    row = db.query(ScreenerSettings).first()
+    if not row:
+        return ScreenerConditions()  # defaults from live_engine.py
+    return ScreenerConditions(
+        cond1_multiplier=int(row.cond1_multiplier),
+        cond1_min_value=int(float(row.cond1_min_value_cr) * ONE_CR),
+        cond2_multiplier=int(row.cond2_multiplier),
+        cond2_min_value=int(float(row.cond2_min_value_cr) * ONE_CR),
+    )
+
+
+async def _conditions_refresh_loop(db: Session) -> None:
+    """Background task: refreshes _conditions_holder from DB every 2 minutes."""
+    while True:
+        await asyncio.sleep(CONDITIONS_REFRESH_SECONDS)
+        try:
+            _conditions_holder[0] = _load_conditions(db)
+            print(f"[{now_ist()}] Screener conditions refreshed: "
+                  f"C1={_conditions_holder[0].cond1_multiplier}x "
+                  f">{_conditions_holder[0].cond1_min_value/ONE_CR:g}Cr, "
+                  f"C2={_conditions_holder[0].cond2_multiplier}x "
+                  f">{_conditions_holder[0].cond2_min_value/ONE_CR:g}Cr")
+        except Exception as e:
+            print(f"[{now_ist()}] Could not refresh screener conditions: {e!r}")
+
+
+# ---------------------------------------------------------------------------
+# Stock state loading
+# ---------------------------------------------------------------------------
 
 def load_stock_states(db: Session, limit: int | None = None) -> dict:
     query = (
@@ -69,19 +108,17 @@ def load_stock_states(db: Session, limit: int | None = None) -> dict:
     return states
 
 
+# ---------------------------------------------------------------------------
+# Alert persistence
+# ---------------------------------------------------------------------------
+
 def save_alert(
     db: Session,
     alert,
     instrument_id: int,
     candle_pct: float | None = None,
     circuit_pct: int | None = None,
-) -> tuple[int, bool]:
-    """
-    Upserts the screener daily stat row.
-    Returns (occurrence_count, is_new_today).
-    is_new_today is True only for the very first alert for this stock today —
-    the caller uses this to decide whether to fetch circuit limits from Ventura.
-    """
+) -> tuple[int, bool, int | None]:
     trade_date = alert.triggered_at.date()
     existing = (
         db.query(ScreenerDailyStat)
@@ -101,7 +138,6 @@ def save_alert(
         existing.last_prev_close = alert.prev_close
         existing.last_condition_matched = alert.condition_matched
         existing.last_candle_pct = candle_pct
-        # Only overwrite circuit_pct if we actually fetched a new value.
         if circuit_pct is not None:
             existing.last_circuit_pct = circuit_pct
         occurrence_count = existing.occurrence_count
@@ -126,12 +162,10 @@ def save_alert(
         ))
 
     db.commit()
-    # return occurrence_count, is_new
     return occurrence_count, is_new, (existing.last_circuit_pct if existing else None)
 
 
 def _update_circuit_pct_in_db(db: Session, instrument_id: int, trade_date, circuit_pct: int) -> None:
-    """Stores a freshly-fetched circuit % on the row created seconds ago by save_alert."""
     try:
         db.query(ScreenerDailyStat).filter_by(
             instrument_id=instrument_id, trade_date=trade_date
@@ -142,11 +176,23 @@ def _update_circuit_pct_in_db(db: Session, instrument_id: int, trade_date, circu
         db.rollback()
 
 
+# ---------------------------------------------------------------------------
+# Engine entry point
+# ---------------------------------------------------------------------------
+
 async def run_engine(limit: int = None, on_alert=None, on_user_alert=None):
     db = SessionLocal()
     try:
         states = load_stock_states(db, limit=limit)
         print(f"Loaded {len(states)} stocks into memory.")
+
+        # Load screener conditions from DB (falls back to defaults if table empty)
+        _conditions_holder[0] = _load_conditions(db)
+        print(f"[{now_ist()}] Screener conditions loaded: "
+              f"C1={_conditions_holder[0].cond1_multiplier}x "
+              f">{_conditions_holder[0].cond1_min_value/ONE_CR:g}Cr  |  "
+              f"C2={_conditions_holder[0].cond2_multiplier}x "
+              f">{_conditions_holder[0].cond2_min_value/ONE_CR:g}Cr")
 
         alert_registry.load_all(SessionLocal)
 
@@ -158,7 +204,6 @@ async def run_engine(limit: int = None, on_alert=None, on_user_alert=None):
         except Exception as e:
             print(f"[{now_ist()}] Auto-trade recovery step failed: {e!r}")
 
-        # NEW (0004): expire "today only" orders from previous trading days.
         try:
             expired = auto_trade_service.expire_daily_auto_orders()
             if expired:
@@ -170,6 +215,7 @@ async def run_engine(limit: int = None, on_alert=None, on_user_alert=None):
             auto_trade_registry.load_all(SessionLocal)
         except Exception as e:
             print(f"[{now_ist()}] Could not load auto orders: {e!r}")
+
         try:
             await asyncio.to_thread(auto_trade_service.prewarm_sessions)
         except Exception as e:
@@ -183,20 +229,30 @@ async def run_engine(limit: int = None, on_alert=None, on_user_alert=None):
         is_startup_before_market_open = now_ist().time() < MARKET_OPEN_CUTOFF
         seen_tokens_this_run = set()
 
-        while True:
-            try:
-                await _connect_and_listen(
-                    states, token_to_instrument_id, db,
-                    is_startup_before_market_open, seen_tokens_this_run,
-                    on_alert=on_alert,
-                    on_user_alert=on_user_alert,
-                )
-            except (websockets.exceptions.ConnectionClosed, ConnectionError, OSError) as e:
-                print(f"[{now_ist()}] Connection lost ({e}). Reconnecting in {RECONNECT_DELAY_SECONDS}s...")
-                await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+        # Start background task to refresh screener conditions every 2 min
+        conditions_task = asyncio.create_task(_conditions_refresh_loop(db))
+
+        try:
+            while True:
+                try:
+                    await _connect_and_listen(
+                        states, token_to_instrument_id, db,
+                        is_startup_before_market_open, seen_tokens_this_run,
+                        on_alert=on_alert,
+                        on_user_alert=on_user_alert,
+                    )
+                except (websockets.exceptions.ConnectionClosed, ConnectionError, OSError) as e:
+                    print(f"[{now_ist()}] Connection lost ({e}). Reconnecting in {RECONNECT_DELAY_SECONDS}s...")
+                    await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+        finally:
+            conditions_task.cancel()
     finally:
         db.close()
 
+
+# ---------------------------------------------------------------------------
+# Heartbeat
+# ---------------------------------------------------------------------------
 
 async def _print_heartbeat(states: dict, tick_counter: dict, interval_seconds: int = 60):
     while True:
@@ -222,6 +278,10 @@ async def _print_heartbeat(states: dict, tick_counter: dict, interval_seconds: i
               f"Closest to triggering: {top5 if top5 else '(none yet)'}. "
               f"Active auto orders: {auto_trade_registry.count()}")
 
+
+# ---------------------------------------------------------------------------
+# Auto trade processing
+# ---------------------------------------------------------------------------
 
 def _process_auto_trade(state, tick, candle_states: dict, is_first_tick_of_day: bool, on_user_alert):
     candle = candle_states.get(tick.exchange_token)
@@ -250,7 +310,7 @@ def _process_auto_trade(state, tick, candle_states: dict, is_first_tick_of_day: 
             candle=candle,
             tick_time=tick.timestamp,
             now=now,
-            prev_close=state.prev_close,  # NEW (0004) — enables day_high_pct_limit check
+            prev_close=state.prev_close,
         )
         if result is None:
             continue
@@ -304,6 +364,10 @@ async def _execute_auto_order_and_notify(order_state, trigger_details: str, on_u
             print(f"[{now_ist()}] Could not deliver auto-trade notification: {e!r}")
 
 
+# ---------------------------------------------------------------------------
+# WebSocket connection and tick loop
+# ---------------------------------------------------------------------------
+
 async def _connect_and_listen(
     states, token_to_instrument_id, db,
     is_startup_before_market_open, seen_tokens_this_run,
@@ -343,9 +407,6 @@ async def _connect_and_listen(
 
         tick_counter = {"count": 0}
         heartbeat_task = asyncio.create_task(_print_heartbeat(states, tick_counter))
-
-        # Per-connection candle states for auto trade (and now candle_pct broadcast).
-        # Reset on reconnect so mid-minute candles aren't trusted.
         candle_states = {}
 
         try:
@@ -371,17 +432,17 @@ async def _connect_and_listen(
                 )
                 seen_tokens_this_run.add(tick.exchange_token)
 
-                alert = process_tick(state, tick, is_first_tick_of_day=is_first_tick_of_day)
+                # Pass live conditions from DB to the screener engine
+                alert = process_tick(
+                    state, tick,
+                    is_first_tick_of_day=is_first_tick_of_day,
+                    conditions=_conditions_holder[0],
+                )
 
                 if alert:
                     instrument_id = token_to_instrument_id.get(tick.exchange_token)
 
-                    # --- Compute current-minute candle % (green candles only). ---
-                    # We use the same candle_states dict that auto trade maintains.
-                    # update_candle hasn't been called for this tick yet (that happens
-                    # in _process_auto_trade below), so we look at the LAST completed
-                    # state. For the very first tick in a minute the open equals LTP,
-                    # giving 0% — acceptable; the tag appears from the second tick onward.
+                    # Compute current-minute candle %
                     candle = candle_states.get(tick.exchange_token)
                     candle_pct = None
                     if (
@@ -396,20 +457,11 @@ async def _connect_and_listen(
                         )
 
                     if instrument_id:
-                        # occurrence_count, is_new = save_alert(
-                        #     db, alert, instrument_id,
-                        #     candle_pct=candle_pct,
-                        #     circuit_pct=None,  # filled in asynchronously below if is_new
-                        # )
                         occurrence_count, is_new, circuit_pct = save_alert(
-                            db, alert, instrument_id, 
+                            db, alert, instrument_id,
                             candle_pct=candle_pct
                         )
 
-
-                        # Fetch circuit limits from Ventura for the first occurrence today.
-                        # Run in a worker thread so the tick loop isn't blocked by the HTTP call.
-                        # circuit_pct = None
                         if is_new and tick.prev_close and tick.prev_close > 0:
                             try:
                                 circuit_pct = await asyncio.to_thread(
@@ -447,12 +499,11 @@ async def _connect_and_listen(
                                 "condition_matched": alert.condition_matched,
                                 "occurrence_count": occurrence_count,
                                 "last_triggered_at": alert.triggered_at.isoformat(),
-                                # NEW (0004)
                                 "candle_pct": candle_pct,
                                 "circuit_pct": circuit_pct,
                             })
 
-                # --- User-defined alerts (requirement 9) ---
+                # --- User-defined alerts ---
                 alerts_for_symbol = alert_registry.get_alerts_for_symbol(state.trading_symbol)
                 if alerts_for_symbol:
                     current_minute_volume = (
@@ -510,7 +561,7 @@ async def _connect_and_listen(
                                     "triggered_at": tick.timestamp.isoformat(),
                                 })
 
-                # --- Auto trade (requirement 10) ---
+                # --- Auto trade ---
                 try:
                     _process_auto_trade(
                         state, tick, candle_states, is_first_tick_of_day, on_user_alert

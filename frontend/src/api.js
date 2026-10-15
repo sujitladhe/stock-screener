@@ -33,13 +33,6 @@ export async function getCurrentSession() {
   return res.json();
 }
 
-/**
- * Explicitly refreshes the Ventura auth token.
- * Returns { client_id, refreshed: bool } on success.
- *   refreshed = false  → token was already valid, no re-login was needed
- *   refreshed = true   → token was stale, a fresh Ventura login was performed
- * Throws an Error (with message from backend) if the re-login itself failed.
- */
 export async function refreshSession() {
   const res = await fetch(`${API_BASE}/auth/refresh`, {
     method: "POST",
@@ -72,6 +65,23 @@ export async function getAvailableDates() {
 
 export function openScreenerSocket() {
   return new WebSocket(`${WS_BASE}/ws/screener`);
+}
+
+// --- Screener settings (conditions) ---
+
+export async function getScreenerSettings() {
+  const res = await fetch(`${API_BASE}/screener/settings`, { credentials: "include" });
+  return handleJson(res, "Failed to load screener settings");
+}
+
+export async function updateScreenerSettings(payload) {
+  const res = await fetch(`${API_BASE}/screener/settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(payload),
+  });
+  return handleJson(res, "Failed to save screener settings");
 }
 
 // --- Ignored stocks ---

@@ -13,6 +13,11 @@ This module is deliberately pure/synchronous and has NO network code —
 it's built this way specifically so the decision logic can be unit
 tested with synthetic tick sequences (see scripts/test_live_engine.py)
 before it's ever wired to a real, hard-to-reproduce live feed.
+
+Screener conditions are now configurable via the Settings page
+(stored in screener_settings DB table). The DEFAULT_CONDITIONS
+constants below serve as fallbacks when no DB row exists.
+Pass a ScreenerConditions instance to process_tick() to override.
 """
 
 from dataclasses import dataclass, field
@@ -21,19 +26,36 @@ from decimal import Decimal
 from typing import Optional
 
 
-# Your confirmed screener conditions:
-#   20x average AND value > 4 Cr, OR 10x average AND value > 6 Cr
-CONDITION_1_MULTIPLIER = 20
-CONDITION_1_MIN_VALUE = 4_00_00_000  # 4 Cr
-CONDITION_2_MULTIPLIER = 10
-CONDITION_2_MIN_VALUE = 6_00_00_000  # 6 Cr
+# ---------------------------------------------------------------------------
+# Default screener conditions (used when DB has no settings row yet).
+# ---------------------------------------------------------------------------
+DEFAULT_COND1_MULTIPLIER = 20
+DEFAULT_COND1_MIN_VALUE  = 4_00_00_000   # 4 Cr
+DEFAULT_COND2_MULTIPLIER = 10
+DEFAULT_COND2_MIN_VALUE  = 6_00_00_000   # 6 Cr
 
 TICK_TIMESTAMP_FORMAT = "%d/%m/%Y %H:%M:%S"
+
+ONE_CR = 1_00_00_000
+
+
+@dataclass
+class ScreenerConditions:
+    """
+    Holds the two screener conditions in raw rupees.
+    Loaded from screener_settings DB table at engine startup and refreshed
+    every 2 minutes. Falls back to the DEFAULT_* constants above when the
+    DB table is empty.
+    """
+    cond1_multiplier: int = DEFAULT_COND1_MULTIPLIER
+    cond1_min_value: int  = DEFAULT_COND1_MIN_VALUE
+    cond2_multiplier: int = DEFAULT_COND2_MULTIPLIER
+    cond2_min_value: int  = DEFAULT_COND2_MIN_VALUE
 
 
 @dataclass
 class StockState:
-    """Live in-memory state for one stock. One of these per subscribed stock, held in a plain dict keyed by exchange_token."""
+    """Live in-memory state for one stock."""
     exchange_token: str
     trading_symbol: str
     avg_volume_per_min: Decimal
@@ -44,8 +66,6 @@ class StockState:
     ltp: Optional[float] = None
     prev_close: Optional[float] = None
 
-    # Prevents re-alerting multiple times within the same minute once
-    # the condition has already fired once (confirmed requirement).
     last_alerted_minute: Optional[datetime] = None
 
 
@@ -65,12 +85,9 @@ class AlertEvent:
     What gets produced when a stock's condition is satisfied.
 
     minute: the truncated (seconds=0) minute bucket — used ONLY for
-    internal dedup logic (has this stock already alerted this minute).
+    internal dedup logic.
     triggered_at: the REAL tick timestamp (actual seconds included) —
-    used for anything shown to a person or stored as "when did this
-    actually happen." These were conflated in an earlier version,
-    which caused every displayed timestamp to show :00 seconds
-    regardless of when the alert genuinely fired.
+    used for anything shown to a person or stored.
     """
     exchange_token: str
     trading_symbol: str
@@ -81,28 +98,29 @@ class AlertEvent:
     multiple: float
     value: float
     ltp: float
-    prev_close: float  # previous day's close — used to compute % change on the frontend
-    condition_matched: str  # "20x_4cr" or "10x_6cr"
+    prev_close: float
+    condition_matched: str  # e.g. "20x_4cr", "10x_6cr", or dynamic values
+
+
+def _cr_label(rupees: int) -> str:
+    """Formats a rupee value as a Crore label, e.g. 40000000 → '4cr'."""
+    cr = rupees / ONE_CR
+    # :g strips trailing zeros: 4.0 → "4", 4.5 → "4.5"
+    return f"{cr:g}cr"
 
 
 def parse_tick(raw_message: list) -> Optional[Tick]:
     """
-    Parses one of Ventura's raw WebSocket tick arrays. Returns None for
-    message shapes we don't recognize (e.g. a future message type)
-    rather than raising, so one unexpected message doesn't crash the
-    whole engine.
+    Parses one of Ventura's raw WebSocket tick arrays.
+    Returns None for unrecognised shapes rather than raising.
 
-    Confirmed real format (from a live test capture):
+    Confirmed real format:
         ["nse:ltp", exchange_token, ltp, open, high, low, close, volume, "DD/MM/YYYY HH:MM:SS"]
-
-    Note: "close" in this feed is the PREVIOUS day's close (standard
-    for a live feed), not today's — kept here since it's useful later
-    for computing %-change, at no extra cost.
     """
     if not isinstance(raw_message, list) or len(raw_message) < 9:
         return None
     if not str(raw_message[0]).endswith(":ltp"):
-        return None  # not a plain LTP tick (e.g. could be a depth message if we ever subscribe to that too)
+        return None
 
     try:
         return Tick(
@@ -116,31 +134,27 @@ def parse_tick(raw_message: list) -> Optional[Tick]:
         return None
 
 
-def process_tick(state: StockState, tick: Tick, is_first_tick_of_day: bool = False) -> Optional[AlertEvent]:
+def process_tick(
+    state: StockState,
+    tick: Tick,
+    is_first_tick_of_day: bool = False,
+    conditions: Optional[ScreenerConditions] = None,
+) -> Optional[AlertEvent]:
     """
     Updates a stock's state with a new tick and returns an AlertEvent
     if a screener condition is newly satisfied this minute, else None.
 
-    is_first_tick_of_day: pass True only when this is genuinely the
-    first tick received for this stock since market open (e.g. engine
-    started before 9:16 AM and this is the very first message for this
-    token). In that case, the minute's baseline is 0, so any volume
-    from the opening auction correctly counts toward the first minute.
-    If the engine reconnects MID-DAY instead, this should be False —
-    otherwise we'd wrongly treat the stock's entire day-so-far volume
-    as "this minute" and fire a false, massive alert. This distinction
-    matters and should not be defaulted casually — see the reconnect
-    handling in ws_client.py for how it's determined in practice.
+    conditions: pass a ScreenerConditions instance to use live DB values.
+                If None, falls back to the DEFAULT_* module constants.
     """
+    cond = conditions if conditions is not None else ScreenerConditions()
+
     minute = tick.timestamp.replace(second=0, microsecond=0)
 
     if state.current_minute is None:
-        # First tick we've ever seen for this stock in this run.
         state.volume_at_minute_start = 0 if is_first_tick_of_day else tick.volume
         state.current_minute = minute
     elif minute != state.current_minute:
-        # A new minute has begun — the baseline for "this minute" is
-        # whatever the cumulative total was right before it started.
         state.volume_at_minute_start = state.latest_volume
         state.current_minute = minute
 
@@ -151,23 +165,19 @@ def process_tick(state: StockState, tick: Tick, is_first_tick_of_day: bool = Fal
     current_minute_volume = state.latest_volume - state.volume_at_minute_start
 
     if current_minute_volume < 0:
-        # Shouldn't happen (cumulative volume shouldn't go backwards
-        # within a day) — could indicate a data glitch or an
-        # unexpected day-rollover. Don't alert on garbage data; just
-        # resync the baseline so we recover cleanly on the next tick.
         state.volume_at_minute_start = state.latest_volume
         return None
 
     value = current_minute_volume * state.ltp
     avg = float(state.avg_volume_per_min)
-
-    condition_matched = None
     multiple = current_minute_volume / avg if avg > 0 else 0
 
-    if current_minute_volume > CONDITION_1_MULTIPLIER * avg and value > CONDITION_1_MIN_VALUE:
-        condition_matched = "20x_4cr"
-    elif current_minute_volume > CONDITION_2_MULTIPLIER * avg and value > CONDITION_2_MIN_VALUE:
-        condition_matched = "10x_6cr"
+    condition_matched = None
+
+    if current_minute_volume > cond.cond1_multiplier * avg and value > cond.cond1_min_value:
+        condition_matched = f"{cond.cond1_multiplier}x_{_cr_label(cond.cond1_min_value)}"
+    elif current_minute_volume > cond.cond2_multiplier * avg and value > cond.cond2_min_value:
+        condition_matched = f"{cond.cond2_multiplier}x_{_cr_label(cond.cond2_min_value)}"
 
     if condition_matched and state.last_alerted_minute != minute:
         state.last_alerted_minute = minute
@@ -175,7 +185,7 @@ def process_tick(state: StockState, tick: Tick, is_first_tick_of_day: bool = Fal
             exchange_token=state.exchange_token,
             trading_symbol=state.trading_symbol,
             minute=minute,
-            triggered_at=tick.timestamp,  # real timestamp, seconds included — this is what should be displayed
+            triggered_at=tick.timestamp,
             current_minute_volume=current_minute_volume,
             avg_volume_per_min=state.avg_volume_per_min,
             multiple=round(multiple, 2),

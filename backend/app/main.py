@@ -1,7 +1,7 @@
 """
 main.py — FastAPI app entry point.
 
-Updated in 0004: includes the ignored router (per-user daily ignore list).
+Updated in 0005: includes the screener_settings router.
 """
 
 import asyncio
@@ -12,7 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.routers import auth, screener, watchlist, instruments, orders, alerts, positions
-from app.routers import ignored  # NEW (0004)
+from app.routers import ignored          # 0004
+from app.routers import screener_settings  # 0005
 from app.ws_manager import manager
 from app import ws_client
 from app import engine_scheduler
@@ -29,8 +30,9 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(screener_settings.router)  # /screener/settings — must come before screener.router
 app.include_router(screener.router)
-app.include_router(ignored.router)   # NEW (0004) — /screener/ignored/*
+app.include_router(ignored.router)            # /screener/ignored/*
 app.include_router(watchlist.router)
 app.include_router(instruments.router)
 app.include_router(orders.router)
