@@ -335,3 +335,22 @@ details.calc[open] summary{margin-bottom:12px;color:var(--text)}
   display: inline-block;
   animation: spin 0.8s linear infinite;
 }
+
+/* ------------------------------------------------------------------ Market Breadth */
+.mb-stat-strip{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:20px}
+.mb-stat{background:var(--raised);border:1px solid var(--line);border-radius:12px;padding:18px 20px;display:flex;flex-direction:column;gap:5px}
+.mb-stat-val{font:700 30px/1.1 var(--font-display);letter-spacing:-.025em;color:var(--text)}
+.mb-stat-label{font-size:12.5px;color:var(--muted)}
+.mb-stat--up   .mb-stat-val{color:var(--up)}
+.mb-stat--down .mb-stat-val{color:var(--down)}
+.mb-tbl{width:100%;border-collapse:collapse;font-size:13.5px}
+.mb-tbl th{padding:11px 16px;border-bottom:1px solid var(--line);color:var(--muted);font-weight:500;font-size:12.5px;text-align:left;white-space:nowrap}
+.mb-tbl th.r,.mb-tbl td.r{text-align:right}
+.mb-tbl td{padding:9px 16px;border-bottom:1px solid var(--line);vertical-align:middle}
+.mb-tbl tbody tr:last-child td{border-bottom:0}
+.mb-tbl tbody tr:hover{background:var(--hover)}
+.mb-tbl tbody tr[data-latest]{background:var(--up-soft)}
+.mb-tbl tbody tr[data-latest]:hover{background:color-mix(in srgb,var(--up-soft) 80%,var(--hover))}
+.mb-track{flex:1;height:8px;border-radius:4px;background:var(--sunken);overflow:hidden;min-width:0}
+.mb-fill{height:100%;border-radius:4px;background:var(--up);transition:width .3s ease}
+@media (max-width:860px){.mb-stat-strip{grid-template-columns:1fr 1fr}.mb-stat-strip .mb-stat:last-child{grid-column:1/-1}}

@@ -294,3 +294,12 @@ export async function placeStoplossOrder(payload) {
   });
   return handleJson(res, "Failed to place stoploss order");
 }
+
+// --- Market Breadth ---
+
+export async function getMarketBreadth(days = 90) {
+  const url = new URL(`${API_BASE}/market-breadth`);
+  url.searchParams.set("days", days);
+  const res = await fetch(url, { credentials: "include" });
+  return handleJson(res, "Failed to load market breadth data");
+}

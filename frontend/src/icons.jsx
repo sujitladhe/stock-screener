@@ -56,6 +56,16 @@ export const RefreshIcon = (p) => (
   </Icon>
 );
 
+// Pulse / activity icon used for Market Breadth in the sidebar.
+export const BreadthIcon = (p) => (
+  <Icon {...p}>
+    <rect x="2" y="3"  width="5" height="14" rx="1.5" />
+    <rect x="9" y="7"  width="5" height="10" rx="1.5" />
+    <rect x="16" y="11" width="5" height="6"  rx="1.5" />
+    <line x1="2" y1="21" x2="22" y2="21" />
+  </Icon>
+);
+
 export const NAV_ICONS = {
   live:       LiveIcon,
   orders:     OrdersIcon,
@@ -63,6 +73,7 @@ export const NAV_ICONS = {
   watchlists: WatchlistsIcon,
   alerts:     AlertsIcon,
   history:    HistoryIcon,
+  breadth:    BreadthIcon,
   ignored:    EyeOffIcon,
   settings:   SettingsIcon,
 };

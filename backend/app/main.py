@@ -2,6 +2,7 @@
 main.py — FastAPI app entry point.
 
 Updated in 0005: includes the screener_settings router.
+Updated in 0008: includes the market_breadth router.
 """
 
 import asyncio
@@ -14,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from app.routers import auth, screener, watchlist, instruments, orders, alerts, positions
 from app.routers import ignored          # 0004
 from app.routers import screener_settings  # 0005
+from app.routers import market_breadth     # 0008 — daily candle breadth
 from app.ws_manager import manager
 from app import ws_client
 from app import engine_scheduler
@@ -38,6 +40,7 @@ app.include_router(instruments.router)
 app.include_router(orders.router)
 app.include_router(alerts.router)
 app.include_router(positions.router)
+app.include_router(market_breadth.router)     # /market-breadth
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 

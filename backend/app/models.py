@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
     Column, String, DateTime, Boolean, Integer, Numeric,
-    UniqueConstraint, Date, Time,
+    UniqueConstraint, Date, Time, BigInteger,
 )
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
@@ -71,6 +71,11 @@ class Instrument(Base):
     last_synced_at = Column(DateTime, default=datetime.utcnow)
 
     angel_symbol_token = Column(String, nullable=True)
+
+    # Added in migration 0007: tracks the calendar date sync_daily_candles.py
+    # last ran for this stock. Used to skip stocks already synced today so
+    # a second run on the same day is nearly instant (no API calls).
+    candles_last_synced_date = Column(Date, nullable=True)
 
 
 class AngelSession(Base):
@@ -278,3 +283,30 @@ class IgnoredStock(Base):
     trading_symbol = Column(String, nullable=False)
     trade_date = Column(Date, nullable=False)
     ignored_at = Column(DateTime, default=now_ist_naive)
+
+
+class DailyCandle(Base):
+    """
+    ONE row per stock per trading day — OHLCV candle data.
+    Added in migration 0006. Populated by scripts/sync_daily_candles.py.
+
+    First run per stock fetches ~365 trading days of history.
+    Subsequent daily runs fetch only the missing days (incremental).
+    Use this table for DB-level scans (volume breakouts, price patterns, etc.)
+    without needing live tick data.
+    """
+    __tablename__ = "daily_candles"
+    __table_args__ = (
+        UniqueConstraint("instrument_id", "candle_date", name="uq_instrument_candle_date"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    instrument_id = Column(Integer, nullable=False, index=True)
+    trading_symbol = Column(String, nullable=False, index=True)
+    candle_date = Column(Date, nullable=False, index=True)
+    open = Column(Numeric, nullable=False)
+    high = Column(Numeric, nullable=False)
+    low = Column(Numeric, nullable=False)
+    close = Column(Numeric, nullable=False)
+    volume = Column(BigInteger, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
