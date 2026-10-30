@@ -4,6 +4,9 @@ main.py — FastAPI app entry point.
 Updated in 0005: includes the screener_settings router.
 Updated in 0008: includes the market_breadth router.
 Updated in 0009: includes the options router + lifespan hooks.
+FIX: the options router already has prefix="/options" built in, so it is
+now included WITHOUT an extra prefix (before, the URLs became
+/options/options/... and the dashboard could never connect).
 """
 
 import asyncio
@@ -45,7 +48,7 @@ app.include_router(orders.router)
 app.include_router(alerts.router)
 app.include_router(positions.router)
 app.include_router(market_breadth.router)     # /market-breadth
-app.include_router(options_router, prefix="/options", tags=["options"])  # 0009
+app.include_router(options_router)            # 0009 — prefix "/options" is already inside the router
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 

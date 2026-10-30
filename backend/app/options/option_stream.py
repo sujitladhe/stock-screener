@@ -10,6 +10,16 @@ Architecture:
 Usage (called from router.py lifespan):
     stream.start_stream(tokens, strike_map, db_factory)
     stream.stop_stream()
+
+FIXES in this version:
+  - Stale login token: the stored Angel One session is now checked for age,
+    and a fresh login is forced when it is old OR when the previous
+    connection attempt died before ever opening.
+  - Subscription correlation IDs shortened to <= 10 characters.
+  - Tokens are subscribed in small batches.
+  - on_open accepts 1 or 2 arguments (different SDK versions differ).
+  - A pause between reconnect attempts so it can never spin in a tight loop.
+  - Real error details are logged instead of just "Connection closed".
 """
 
 import asyncio
@@ -18,7 +28,7 @@ import logging
 import math
 import threading
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Set
 from sqlalchemy.orm import Session
 
@@ -65,50 +75,62 @@ NSE_EXCHANGE_TYPE = 1          # Angel One enum for NSE
 MODE_LTP         = 1
 MODE_SNAPQUOTE   = 3
 
+# A stored Angel One login older than this is treated as stale and replaced.
+MAX_SESSION_AGE = timedelta(hours=6)
 
-def _get_credentials(db_factory) -> tuple:
+# How many option tokens to send per subscribe message.
+SUBSCRIBE_BATCH_SIZE = 200
+
+# Seconds to wait between connection attempts.
+RECONNECT_PAUSE_SECONDS = 10
+
+
+def _session_is_stale(session_row) -> bool:
+    """True if the stored Angel One login is missing, incomplete or too old."""
+    if not session_row or not session_row.jwt_token or not session_row.feed_token:
+        return True
+    if not session_row.logged_in_at:
+        return True
+    # logged_in_at is stored with datetime.utcnow() in angel_client.py
+    return (datetime.utcnow() - session_row.logged_in_at) > MAX_SESSION_AGE
+
+
+def _get_credentials(db_factory, force_fresh: bool = False) -> tuple:
     """
-    Return (auth_token, feed_token, api_key, client_code) by REUSING the
-    existing Angel One session stored in the DB by angel_client.py.
+    Return (auth_token, feed_token, api_key, client_code).
 
-    We must NOT call SmartConnect.generateSession() here — doing so creates a
-    brand-new JWT which instantly invalidates the token the main screener is
-    already using (Angel One only allows one active session per client code).
-    The two processes would then keep killing each other's sessions in a loop.
-
-    If no session exists yet we fall back to angel_client.get_valid_jwt_token(),
-    which stores the new token for both sides to share.
+    Reuses the Angel One session stored in the DB by angel_client.py so we do
+    NOT fight with the rest of the app (Angel One allows one active session per
+    client code). BUT the stored session is only reused when it is recent.
+    If it is old/missing, or force_fresh is True (the last connection attempt
+    failed before opening), we log in again through the shared angel_client
+    helper, which stores the new token for everyone to share.
     """
     from app.models import AngelSession
     from app import angel_client
 
     with db_factory() as db:
         session_row = db.query(AngelSession).first()
-        if session_row and session_row.jwt_token and session_row.feed_token:
-            return (
-                session_row.jwt_token,
-                session_row.feed_token,
-                settings.angel_api_key,
+
+        if force_fresh or _session_is_stale(session_row):
+            logger.info(
+                "Angel One session is stale/missing or last attempt failed — "
+                "performing a fresh login."
+            )
+            session_row = angel_client._login_and_store(
+                db,
                 settings.angel_client_code,
+                settings.angel_mpin,
+                settings.angel_api_key,
+                settings.angel_totp_secret,
             )
 
-        # No session row yet — create one via the shared angel_client helper so
-        # both the REST callers and the WS connection share the same token.
-        logger.info("No existing Angel One session found — performing fresh login.")
-        jwt = angel_client.get_valid_jwt_token(
-            db,
-            settings.angel_client_code,
-            settings.angel_mpin,
-            settings.angel_api_key,
-            settings.angel_totp_secret,
-        )
-        session_row = db.query(AngelSession).first()
-        feed_token = session_row.feed_token if session_row else None
+        jwt = session_row.jwt_token
+        feed_token = session_row.feed_token
 
-    if not feed_token:
+    if not jwt or not feed_token:
         raise RuntimeError(
-            "Angel One session has no feed_token — ensure the main screener "
-            "has logged in at least once before starting the options stream."
+            "Angel One login did not return a jwt_token / feed_token."
         )
 
     return jwt, feed_token, settings.angel_api_key, settings.angel_client_code
@@ -180,39 +202,52 @@ def _ws_worker(tokens: List[str], db_factory) -> None:
     """Runs in a daemon thread. Reconnects on error."""
     global _sws_instance
 
+    # After a failed attempt (connection never opened) we force a fresh login
+    # next time, because the most common cause is an expired token.
+    force_fresh = False
+
     while not _stop_event.is_set():
+        opened = {"value": False}
         try:
-            auth_token, feed_token, api_key, client_code = _get_credentials(db_factory)
+            auth_token, feed_token, api_key, client_code = _get_credentials(
+                db_factory, force_fresh=force_fresh
+            )
 
             sws = SmartWebSocketV2(auth_token, api_key, client_code, feed_token)
             _sws_instance = sws
 
-            def on_open(ws, _resp):
+            def on_open(ws, *_args):
                 logger.info("Angel One option WS opened")
+                opened["value"] = True
                 with _lock:
                     option_chain_state["connected"] = True
 
-                # Subscribe to NFO options (SnapQuote)
-                nfo_token_list  = [{"exchangeType": NFO_EXCHANGE_TYPE, "tokens": tokens}]
-                sws.subscribe("opt-chain-1", MODE_SNAPQUOTE, nfo_token_list)
+                # Subscribe to NFO options (SnapQuote) in small batches.
+                # Correlation IDs must be 10 characters or fewer.
+                for n, i in enumerate(range(0, len(tokens), SUBSCRIBE_BATCH_SIZE)):
+                    batch = tokens[i:i + SUBSCRIBE_BATCH_SIZE]
+                    nfo_token_list = [{"exchangeType": NFO_EXCHANGE_TYPE, "tokens": batch}]
+                    sws.subscribe(f"optchn{n:03d}", MODE_SNAPQUOTE, nfo_token_list)
+                    time.sleep(0.2)
 
                 # Subscribe to NIFTY index spot (LTP only)
                 nse_token_list = [{"exchangeType": NSE_EXCHANGE_TYPE,
                                    "tokens": [NIFTY_INDEX_TOKEN]}]
-                sws.subscribe("nifty-spot-1", MODE_LTP, nse_token_list)
+                sws.subscribe("niftyspot", MODE_LTP, nse_token_list)
+                logger.info(f"Subscribed to {len(tokens)} option tokens + NIFTY spot.")
 
-            def on_data(_ws, message):
+            def on_data(_ws, message, *_args):
                 try:
                     _process_tick(message)
                 except Exception as e:
                     logger.debug(f"Tick processing error: {e}")
 
-            def on_error(_ws, error):
-                logger.warning(f"Angel One option WS error: {error}")
+            def on_error(_ws, *args):
+                logger.warning(f"Angel One option WS error: {args}")
                 with _lock:
                     option_chain_state["connected"] = False
 
-            def on_close(_ws):
+            def on_close(_ws, *args):
                 logger.info("Angel One option WS closed")
                 with _lock:
                     option_chain_state["connected"] = False
@@ -223,11 +258,27 @@ def _ws_worker(tokens: List[str], db_factory) -> None:
             sws.on_close = on_close
             sws.connect()  # blocking
 
-        except Exception as exc:
-            logger.error(f"WS worker error: {exc}. Reconnecting in 10s…")
+            # connect() returned: the connection ended.
             with _lock:
                 option_chain_state["connected"] = False
-            _stop_event.wait(10)
+
+            if opened["value"]:
+                # It worked for a while, so the token was fine. Just reconnect
+                # (the age check will refresh the token if it has become old).
+                force_fresh = False
+            else:
+                # Never opened -> almost certainly a rejected/expired token.
+                logger.warning("Option WS never opened — will log in fresh on next attempt.")
+                force_fresh = True
+
+        except Exception as exc:
+            logger.error(f"WS worker error: {exc}. Retrying in {RECONNECT_PAUSE_SECONDS}s…")
+            with _lock:
+                option_chain_state["connected"] = False
+            force_fresh = True
+
+        # Always pause before the next attempt (never spin in a tight loop).
+        _stop_event.wait(RECONNECT_PAUSE_SECONDS)
 
     logger.info("WS worker stopped.")
 
@@ -248,7 +299,6 @@ def load_prev_oi(db: Session) -> None:
     Required for OI change % calculation during the session.
     Call this while a valid DB session is open.
     """
-    from datetime import timedelta
     yesterday = date.today() - timedelta(days=1)
 
     rows = (
