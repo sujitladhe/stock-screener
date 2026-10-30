@@ -9,6 +9,7 @@ import Positions from "./pages/Positions";
 import Settings from "./pages/Settings";
 import Ignored from "./pages/Ignored";
 import MarketBreadth from "./pages/MarketBreadth";
+import OptionsDashboard from "./pages/OptionsDashboard";
 import ToastStack from "./components/ToastStack";
 import { getCurrentSession, logout, getIgnoredStocks, refreshSession } from "./api";
 import { useScreenerSocket } from "./hooks/useScreenerSocket";
@@ -30,6 +31,7 @@ const NAV = [
   ["alerts",     "Alerts"],
   ["history",    "History"],
   ["breadth",    "Market Breadth"],
+  ["options",    "Options"],
   ["ignored",    "Ignored"],
   ["settings",   "Settings"],
 ];
@@ -205,6 +207,8 @@ export default function App() {
     page = <Ignored onKeepWatch={loadIgnored} />;
   } else if (view === "breadth") {
     page = <MarketBreadth />;
+  } else if (view === "options") {
+    page = <OptionsDashboard />;
   } else {
     page = (
       <Screener

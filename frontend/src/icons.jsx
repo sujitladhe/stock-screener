@@ -66,6 +66,21 @@ export const BreadthIcon = (p) => (
   </Icon>
 );
 
+// Candlestick / options icon used for the Option Dashboard in the sidebar.
+export const OptionsIcon = (p) => (
+  <Icon {...p}>
+    <rect x="2"  y="10" width="4" height="9"  rx="1" />
+    <rect x="10" y="6"  width="4" height="13" rx="1" />
+    <rect x="18" y="2"  width="4" height="17" rx="1" />
+    <line x1="4"  y1="10" x2="4"  y2="7"  />
+    <line x1="12" y1="6"  x2="12" y2="3"  />
+    <line x1="20" y1="2"  x2="20" y2="1"  />
+    <line x1="4"  y1="19" x2="4"  y2="22" />
+    <line x1="12" y1="19" x2="12" y2="22" />
+    <line x1="20" y1="19" x2="20" y2="22" />
+  </Icon>
+);
+
 export const NAV_ICONS = {
   live:       LiveIcon,
   orders:     OrdersIcon,
@@ -74,6 +89,7 @@ export const NAV_ICONS = {
   alerts:     AlertsIcon,
   history:    HistoryIcon,
   breadth:    BreadthIcon,
+  options:    OptionsIcon,
   ignored:    EyeOffIcon,
   settings:   SettingsIcon,
 };

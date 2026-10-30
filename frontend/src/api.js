@@ -303,3 +303,22 @@ export async function getMarketBreadth(days = 90) {
   const res = await fetch(url, { credentials: "include" });
   return handleJson(res, "Failed to load market breadth data");
 }
+
+// --- Options ---
+
+export const optionsApi = {
+  refreshMaster: () =>
+    fetch(`${API_BASE}/options/master/refresh`, { method: "POST", credentials: "include" }).then(r => r.json()),
+  startStream: () =>
+    fetch(`${API_BASE}/options/stream/start`, { method: "POST", credentials: "include" }).then(r => r.json()),
+  stopStream: () =>
+    fetch(`${API_BASE}/options/stream/stop`, { method: "POST", credentials: "include" }).then(r => r.json()),
+  getStatus: () =>
+    fetch(`${API_BASE}/options/status`, { credentials: "include" }).then(r => r.json()),
+  getChain: () =>
+    fetch(`${API_BASE}/options/chain`, { credentials: "include" }).then(r => r.json()),
+  saveEod: () =>
+    fetch(`${API_BASE}/options/eod/snapshot`, { method: "POST", credentials: "include" }).then(r => r.json()),
+  getHistory: (date) =>
+    fetch(`${API_BASE}/options/history?date=${date}`, { credentials: "include" }).then(r => r.json()),
+};

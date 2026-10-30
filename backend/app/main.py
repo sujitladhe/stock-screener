@@ -3,6 +3,7 @@ main.py — FastAPI app entry point.
 
 Updated in 0005: includes the screener_settings router.
 Updated in 0008: includes the market_breadth router.
+Updated in 0009: includes the options router + lifespan hooks.
 """
 
 import asyncio
@@ -16,10 +17,13 @@ from app.routers import auth, screener, watchlist, instruments, orders, alerts, 
 from app.routers import ignored          # 0004
 from app.routers import screener_settings  # 0005
 from app.routers import market_breadth     # 0008 — daily candle breadth
+from app.options.router import router as options_router  # 0009 — option dashboard
+from app.options.router import startup as options_startup, shutdown as options_shutdown
 from app.ws_manager import manager
 from app import ws_client
 from app import engine_scheduler
 from app.config import settings
+from app.database import SessionLocal
 
 app = FastAPI(title="Screener App")
 
@@ -41,6 +45,7 @@ app.include_router(orders.router)
 app.include_router(alerts.router)
 app.include_router(positions.router)
 app.include_router(market_breadth.router)     # /market-breadth
+app.include_router(options_router, prefix="/options", tags=["options"])  # 0009
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -64,6 +69,18 @@ async def start_live_engine():
         )
 
     app.state.engine_task = asyncio.create_task(coro)
+
+
+@app.on_event("startup")
+async def start_options():
+    """Start the Option Dashboard background broadcast loop."""
+    await options_startup(SessionLocal)
+
+
+@app.on_event("shutdown")
+async def stop_options():
+    """Stop the Option Dashboard stream and broadcast loop cleanly."""
+    await options_shutdown()
 
 
 @app.get("/health")
