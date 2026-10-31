@@ -2,12 +2,14 @@
  * OptionChain — 9-column option chain table.
  * Columns: CE Signal | CE OI bar | CE Vol+VOI | CE LTP | STRIKE | PE LTP | PE Vol+VOI | PE OI bar | PE Signal
  *
- * Props: { chainData, guidance, classifyCe, classifyPe }
+ * Prices / OI / volume are live. The signal badges and the OI-change % come
+ * from the server engine (per-strike price-vs-OI change over the look-back
+ * window) so they stay stable between 5-minute decisions.
+ *
+ * Props: { chainData, guidance }
  */
 
 import { useMemo } from "react";
-
-const STRIKE_STEP = 50;
 
 function OIBar({ oi, maxOI, side }) {
   const pct = maxOI > 0 ? (oi / maxOI) * 100 : 0;
@@ -42,50 +44,45 @@ function fmtVOI(v) {
   return v.toFixed(2);
 }
 
-export default function OptionChain({ chainData, guidance, classifyCe, classifyPe }) {
+export default function OptionChain({ chainData, guidance }) {
   const { strikes = {}, atm = 0 } = chainData;
+  const strikeSignals = guidance?.strikeSignals || {};
 
-  // Determine if it's a down day from guidance
-  const isDownDay = guidance?.is_down_day ?? false;
-
-  // Highlighted strikes from guidance
   const highlightedStrikes = useMemo(() => {
     const set = new Set();
-    (guidance?.opportunities || []).forEach(op => {
+    (guidance?.opportunities || []).forEach((op) => {
       if (op.strike) set.add(op.strike);
       if (op.pe_strike) set.add(op.pe_strike);
     });
-    (guidance?.spike_alerts || []).forEach(a => set.add(a.strike));
+    (guidance?.spikeAlerts || []).forEach((a) => set.add(a.strike));
     return set;
   }, [guidance]);
 
-  // Sorted strikes
+  const spikeKeys = useMemo(
+    () => new Set((guidance?.spikeAlerts || []).map((a) => `${a.strike}-${a.type}`)),
+    [guidance]
+  );
+
   const sortedStrikes = useMemo(
     () => Object.keys(strikes).map(Number).sort((a, b) => b - a),
     [strikes]
   );
 
-  // Max OI for bar scale
   const maxCeOI = useMemo(
-    () => Math.max(...sortedStrikes.map(s => strikes[s]?.ce?.oi || 0), 1),
+    () => Math.max(...sortedStrikes.map((s) => strikes[s]?.ce?.oi || 0), 1),
     [sortedStrikes, strikes]
   );
   const maxPeOI = useMemo(
-    () => Math.max(...sortedStrikes.map(s => strikes[s]?.pe?.oi || 0), 1),
+    () => Math.max(...sortedStrikes.map((s) => strikes[s]?.pe?.oi || 0), 1),
     [sortedStrikes, strikes]
   );
 
   if (sortedStrikes.length === 0) {
-    return (
-      <div className="opt-chain-empty">
-        Waiting for option chain data…
-      </div>
-    );
+    return <div className="opt-chain-empty">Waiting for option chain data…</div>;
   }
 
   return (
     <div className="opt-chain-wrap">
-      {/* Column header */}
       <div className="opt-chain-hdr opt-crow">
         <span>CE Signal</span>
         <span>CE OI</span>
@@ -98,48 +95,38 @@ export default function OptionChain({ chainData, guidance, classifyCe, classifyP
         <span>PE Signal</span>
       </div>
 
-      {/* Rows */}
       <div className="opt-chain-body">
-        {sortedStrikes.map(strike => {
+        {sortedStrikes.map((strike) => {
           const ce = strikes[strike]?.ce;
           const pe = strikes[strike]?.pe;
+          const ceSig = strikeSignals[strike]?.ce;
+          const peSig = strikeSignals[strike]?.pe;
 
-          const ceClass   = ce ? classifyCe(ce.oi_chg_pct || 0, isDownDay) : null;
-          const peClass   = pe ? classifyPe(pe.oi_chg_pct || 0, isDownDay) : null;
-
-          const isAtm     = strike === atm;
-          const isHlt     = highlightedStrikes.has(strike);
-
-          // Spike detection on this row
-          const ceSurge = ce && Math.abs(ce.oi_chg_pct || 0) >= 3.5 && (ce.voi || 0) > 0.5;
-          const peSurge = pe && Math.abs(pe.oi_chg_pct || 0) >= 3.5 && (pe.voi || 0) > 0.5;
+          const isAtm = strike === atm;
+          const isHlt = highlightedStrikes.has(strike);
+          const ceSpike = spikeKeys.has(`${strike}-CE`);
+          const peSpike = spikeKeys.has(`${strike}-PE`);
 
           return (
             <div
               key={strike}
-              className={[
-                "opt-crow",
-                isAtm  ? "opt-crow--atm"  : "",
-                isHlt  ? "opt-crow--hlt"  : "",
-              ].filter(Boolean).join(" ")}
+              className={["opt-crow", isAtm ? "opt-crow--atm" : "", isHlt ? "opt-crow--hlt" : ""]
+                .filter(Boolean).join(" ")}
             >
-              {/* CE Signal */}
               <span className="opt-cell opt-cell--signal">
-                {ceSurge && <span className="opt-spike-badge" title="OI spike">⚡</span>}
-                <SignalBadge cls={ceClass?.css} label={ceClass?.label} />
-                {ce?.oi_chg_pct != null && (
-                  <span className={`opt-oi-chg ${ce.oi_chg_pct >= 0 ? "up" : "dn"}`}>
-                    {ce.oi_chg_pct > 0 ? "+" : ""}{ce.oi_chg_pct?.toFixed(1)}%
+                {ceSpike && <span className="opt-spike-badge" title="OI spike">⚡</span>}
+                <SignalBadge cls={ceSig?.css} label={ceSig?.label} />
+                {ceSig?.oi_chg_pct != null && (
+                  <span className={`opt-oi-chg ${ceSig.oi_chg_pct >= 0 ? "up" : "dn"}`}>
+                    {ceSig.oi_chg_pct > 0 ? "+" : ""}{ceSig.oi_chg_pct.toFixed(1)}%
                   </span>
                 )}
               </span>
 
-              {/* CE OI bar */}
               <span className="opt-cell opt-cell--oi">
                 <OIBar oi={ce?.oi || 0} maxOI={maxCeOI} side="ce" />
               </span>
 
-              {/* CE Vol + VOI */}
               <span className="opt-cell opt-cell--vol">
                 <span>{fmtOI(ce?.volume)}</span>
                 {ce?.voi != null && (
@@ -149,23 +136,15 @@ export default function OptionChain({ chainData, guidance, classifyCe, classifyP
                 )}
               </span>
 
-              {/* CE LTP */}
-              <span className="opt-cell opt-cell--ltp opt-cell--ce-ltp">
-                {fmtLTP(ce?.ltp)}
-              </span>
+              <span className="opt-cell opt-cell--ltp opt-cell--ce-ltp">{fmtLTP(ce?.ltp)}</span>
 
-              {/* STRIKE */}
               <span className={`opt-cell opt-strike-col ${isAtm ? "opt-atm-label" : ""}`}>
                 {strike}
                 {isAtm && <span className="opt-atm-tag">ATM</span>}
               </span>
 
-              {/* PE LTP */}
-              <span className="opt-cell opt-cell--ltp opt-cell--pe-ltp">
-                {fmtLTP(pe?.ltp)}
-              </span>
+              <span className="opt-cell opt-cell--ltp opt-cell--pe-ltp">{fmtLTP(pe?.ltp)}</span>
 
-              {/* PE Vol + VOI */}
               <span className="opt-cell opt-cell--vol">
                 <span>{fmtOI(pe?.volume)}</span>
                 {pe?.voi != null && (
@@ -175,18 +154,16 @@ export default function OptionChain({ chainData, guidance, classifyCe, classifyP
                 )}
               </span>
 
-              {/* PE OI bar */}
               <span className="opt-cell opt-cell--oi">
                 <OIBar oi={pe?.oi || 0} maxOI={maxPeOI} side="pe" />
               </span>
 
-              {/* PE Signal */}
               <span className="opt-cell opt-cell--signal">
-                {peSurge && <span className="opt-spike-badge" title="OI spike">⚡</span>}
-                <SignalBadge cls={peClass?.css} label={peClass?.label} />
-                {pe?.oi_chg_pct != null && (
-                  <span className={`opt-oi-chg ${pe.oi_chg_pct >= 0 ? "up" : "dn"}`}>
-                    {pe.oi_chg_pct > 0 ? "+" : ""}{pe.oi_chg_pct?.toFixed(1)}%
+                {peSpike && <span className="opt-spike-badge" title="OI spike">⚡</span>}
+                <SignalBadge cls={peSig?.css} label={peSig?.label} />
+                {peSig?.oi_chg_pct != null && (
+                  <span className={`opt-oi-chg ${peSig.oi_chg_pct >= 0 ? "up" : "dn"}`}>
+                    {peSig.oi_chg_pct > 0 ? "+" : ""}{peSig.oi_chg_pct.toFixed(1)}%
                   </span>
                 )}
               </span>

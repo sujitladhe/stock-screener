@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Column, Integer, String, Date, DateTime, Numeric,
-    BigInteger, UniqueConstraint, Index,
+    BigInteger, Boolean, UniqueConstraint, Index,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
@@ -79,3 +79,53 @@ class OptionGuidanceLog(Base):
     top_opportunity_type     = Column(String(20), nullable=True)
     signal_breakdown         = Column(JSONB, nullable=True)
     created_at               = Column(DateTime, default=datetime.utcnow)
+
+
+class OptionMinuteSnapshot(Base):
+    """One row per strike per minute — the engine's long-term memory (added in 0011)."""
+    __tablename__ = "option_minute_snapshot"
+
+    id        = Column(BigInteger, primary_key=True, autoincrement=True)
+    bucket_ts = Column(DateTime, nullable=False)        # IST wall-clock minute
+    expiry    = Column(Date, nullable=False)
+    strike    = Column(Integer, nullable=False)
+    spot      = Column(Numeric(10, 2), nullable=True)
+    ce_ltp    = Column(Numeric(12, 2), nullable=True)
+    pe_ltp    = Column(Numeric(12, 2), nullable=True)
+    ce_oi     = Column(BigInteger, nullable=True)
+    pe_oi     = Column(BigInteger, nullable=True)
+    ce_volume = Column(BigInteger, nullable=True)
+    pe_volume = Column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("bucket_ts", "expiry", "strike",
+                         name="uq_option_minute_ts_expiry_strike"),
+        Index("ix_option_minute_ts", "bucket_ts"),
+    )
+
+
+class OptionDecisionLog(Base):
+    """Every 5-minute engine decision + what NIFTY did afterwards (added in 0011)."""
+    __tablename__ = "option_decision_log"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    decided_at    = Column(DateTime, nullable=False, index=True)   # IST wall-clock
+    expiry        = Column(Date, nullable=True)
+    spot          = Column(Numeric(10, 2), nullable=True)
+    raw_score     = Column(Integer, nullable=True)
+    raw_bias      = Column(String(20), nullable=True)
+    bias          = Column(String(20), nullable=True)              # the CONFIRMED bias
+    pending_bias  = Column(String(20), nullable=True)
+    pending_count = Column(Integer, nullable=True)
+    confidence    = Column(Integer, nullable=True)
+    metrics       = Column(JSONB, nullable=True)
+    signals       = Column(JSONB, nullable=True)
+    opportunities = Column(JSONB, nullable=True)
+    spike_alerts  = Column(JSONB, nullable=True)
+    spot_15m      = Column(Numeric(10, 2), nullable=True)
+    spot_30m      = Column(Numeric(10, 2), nullable=True)
+    spot_60m      = Column(Numeric(10, 2), nullable=True)
+    high_60m      = Column(Numeric(10, 2), nullable=True)
+    low_60m       = Column(Numeric(10, 2), nullable=True)
+    outcome_done  = Column(Boolean, nullable=False, default=False, server_default="false")
+    created_at    = Column(DateTime, default=datetime.utcnow)

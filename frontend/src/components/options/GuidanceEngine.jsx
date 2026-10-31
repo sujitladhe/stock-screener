@@ -1,20 +1,23 @@
 /**
- * GuidanceEngine — rule-based analytical engine section.
+ * GuidanceEngine — shows the server-side engine's decision.
  * Props: { guidance }
+ *
+ * The engine decides every 5 minutes using smoothed data and a confirmation
+ * rule, so what you see here is intentionally stable.
  */
 
-import { useMemo } from "react";
-
 const BIAS_COLORS = {
-  "BEARISH":      "#ef4444",
-  "MILD BEARISH": "#f97316",
-  "NEUTRAL":      "#6b7280",
-  "MILD BULLISH": "#84cc16",
-  "BULLISH":      "#22c55e",
+  "BEARISH": "#ef4444",
+  "NEUTRAL": "#6b7280",
+  "BULLISH": "#22c55e",
 };
 
 function biasColor(bias) {
   return BIAS_COLORS[bias] || "#6b7280";
+}
+
+function hhmm(iso) {
+  return iso ? iso.slice(11, 16) : "";
 }
 
 function ConfRing({ conf }) {
@@ -59,7 +62,10 @@ function OpCard({ op }) {
   const riskCls   = op.risk === "Low" ? "low" : op.risk === "Med" ? "med" : "high";
 
   return (
-    <div className={`opt-op-card opt-op-card--${typeCls} ${isSpike ? "opt-op-card--spike" : ""}`}>
+    <div
+      className={`opt-op-card opt-op-card--${typeCls} ${isSpike ? "opt-op-card--spike" : ""}`}
+      style={op.fading ? { opacity: 0.6 } : undefined}
+    >
       <div className="opt-op-card__head">
         <span className={`opt-op-badge opt-op-badge--${typeCls}`}>{typeLabel}</span>
         <span className="opt-op-strike">
@@ -73,25 +79,29 @@ function OpCard({ op }) {
         ))}
       </ul>
       <div className="opt-op-foot">
-        <span className={`opt-risk-badge opt-risk-badge--${riskCls}`}>
-          {op.risk} Risk
-        </span>
+        <span className={`opt-risk-badge opt-risk-badge--${riskCls}`}>{op.risk} Risk</span>
         {isSpike && <span className="opt-time-sensitive">Time-sensitive</span>}
+        {op.fading && <span className="opt-time-sensitive">Fading — may be removed</span>}
+        {!op.fading && !isSpike && op.cycles > 1 && (
+          <span className="muted small">Held {op.cycles} cycles</span>
+        )}
       </div>
     </div>
   );
 }
 
 function SpikeAlert({ alert }) {
-  const dir = alert.oi_chg_pct > 0 ? "surge" : "drop";
   return (
-    <div className="opt-spike-alert">
+    <div className="opt-spike-alert" style={alert.fading ? { opacity: 0.6 } : undefined}>
       <span className="opt-spike-alert__badge">⚡ SPIKE</span>
       <span className="opt-spike-alert__info">
-        {alert.strike} {alert.type} — OI {dir} {alert.oi_chg_pct > 0 ? "+" : ""}
-        {alert.oi_chg_pct?.toFixed(1)}% · V:OI {alert.voi?.toFixed(2)} · LTP {alert.ltp}
+        {alert.strike} {alert.type} — OI {alert.oi_chg_pct > 0 ? "+" : ""}
+        {alert.oi_chg_pct?.toFixed(1)}% in {alert.window_min}m · V:OI {alert.voi?.toFixed(2)} · LTP {alert.ltp}
       </span>
       <span className="opt-spike-alert__dist">{alert.dist_from_spot}pts OTM</span>
+      {alert.verdict && (
+        <span className="muted small" style={{ flexBasis: "100%" }}>{alert.verdict}</span>
+      )}
     </div>
   );
 }
@@ -106,27 +116,51 @@ export default function GuidanceEngine({ guidance }) {
     );
   }
 
-  const { score, bias, confidence, signals = [], opportunities = [], spikeAlerts = [] } = guidance;
+  if (guidance.warmingUp) {
+    return (
+      <div className="opt-guidance">
+        <div className="opt-guidance__header">
+          <h3 className="opt-guidance__title">Guidance Engine</h3>
+          <span className="opt-guidance__refresh">↻ decides every 5 min</span>
+        </div>
+        <div className="opt-no-ops">{guidance.message || "Collecting data…"}</div>
+        {guidance.spikeAlerts?.length > 0 && (
+          <div className="opt-spikes">
+            <div className="opt-spikes__header">⚡ Spike Alerts</div>
+            {guidance.spikeAlerts.map((a, i) => <SpikeAlert key={i} alert={a} />)}
+          </div>
+        )}
+      </div>
+    );
+  }
 
-  const spectrumLeft = useMemo(() => {
-    // Map score -5…+5 to 0%…100%
-    return `${((score + 5) / 10) * 100}%`;
-  }, [score]);
+  const {
+    score, bias, confidence, signals = [], flags = [], opportunities = [], spikeAlerts = [],
+    pendingBias, pendingCount, confirmCycles, biasSince, evaluatedAt, windowMin,
+  } = guidance;
 
+  const spectrumLeft = `${((score + 5) / 10) * 100}%`;
   const bColor = biasColor(bias);
 
   return (
     <div className="opt-guidance" style={{ "--bias-color": bColor }}>
       <div className="opt-guidance__header">
         <h3 className="opt-guidance__title">Guidance Engine</h3>
-        <span className="opt-guidance__refresh">↻ 12s cycle</span>
+        <span className="opt-guidance__refresh">
+          ↻ every 5 min{evaluatedAt ? ` · decided ${hhmm(evaluatedAt)}` : ""}
+        </span>
       </div>
 
-      {/* Bias panel */}
       <div className="opt-bias-panel">
         <div className="opt-bias-main">
           <span className="opt-bias-label" style={{ color: bColor }}>{bias}</span>
-          <span className="opt-bias-conf">{confidence}% confidence</span>
+          <span className="opt-bias-conf">{confidence}% agreement</span>
+        </div>
+        <div className="muted small">
+          {biasSince ? `Confirmed since ${hhmm(biasSince)}` : "Confirmed bias"}
+          {pendingBias
+            ? ` · possible shift to ${pendingBias} (${pendingCount}/${confirmCycles} confirmations)`
+            : ""}
         </div>
         <div className="opt-spectrum">
           <span className="opt-spectrum__label opt-spectrum__label--bear">BEAR</span>
@@ -138,15 +172,24 @@ export default function GuidanceEngine({ guidance }) {
         </div>
       </div>
 
-      {/* Signal breakdown */}
+      {flags.length > 0 && (
+        <div className="opt-spikes">
+          {flags.map((f, i) => (
+            <div key={i} className="opt-spike-alert">
+              <span className="opt-spike-alert__badge">{f.label}</span>
+              <span className="opt-spike-alert__info">{f.note}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {signals.length > 0 && (
         <div className="opt-signals">
-          <div className="opt-signals__header">Signal breakdown</div>
+          <div className="opt-signals__header">Signal breakdown{windowMin ? ` (OI window ${windowMin} min)` : ""}</div>
           {signals.map((s, i) => <SignalRow key={i} signal={s} />)}
         </div>
       )}
 
-      {/* Spike alerts — highest priority */}
       {spikeAlerts.length > 0 && (
         <div className="opt-spikes">
           <div className="opt-spikes__header">⚡ Spike Alerts</div>
@@ -154,17 +197,16 @@ export default function GuidanceEngine({ guidance }) {
         </div>
       )}
 
-      {/* Opportunity cards */}
       {opportunities.length > 0 ? (
         <div className="opt-opportunities">
           <div className="opt-opportunities__header">Selling Opportunities</div>
           <div className="opt-op-grid">
-            {opportunities.map((op, i) => <OpCard key={i} op={op} />)}
+            {opportunities.map((op, i) => <OpCard key={`${op.type}-${op.strike}-${i}`} op={op} />)}
           </div>
         </div>
       ) : (
         <div className="opt-no-ops">
-          No high-confidence opportunities right now. Monitor signals.
+          No confirmed opportunities right now. A setup must hold for a couple of cycles before it appears.
         </div>
       )}
     </div>

@@ -1,12 +1,13 @@
 /**
  * useOptionStream — React hook for the option chain WebSocket.
  *
- * Returns:
- *   { chainData, metrics, guidance, isConnected, error }
+ * Returns: { chainData, metrics, guidance, isConnected, error }
  *
- * chainData.strikes: { [strike: string]: { ce, pe } }
- * metrics: { spot, pcr, maxPain, atmIv, ivSkew, expectedMove, totalCeOI, totalPeOI }
- * guidance: { score, bias, confidence, signals, opportunities, spikeAlerts }
+ * The chain (prices / OI) updates live. The guidance (bias, signals,
+ * opportunities, per-strike OI labels) is produced by the server-side engine
+ * every 5 minutes and is already smoothed and confirmed — the browser does not
+ * recompute it. PCR / max pain / IV / skew / expected move shown in the metric
+ * strip also come from the engine (smoothed) once it has a decision.
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -14,24 +15,6 @@ import { useEffect, useRef, useState, useCallback } from "react";
 const WS_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/options/ws`;
 const RECONNECT_DELAY = 3000;
 const PING_INTERVAL   = 20000;
-
-// ─── OI classification ─────────────────────────────────────────────────────
-
-function classifyCe(oiChgPct, isDownDay) {
-  if (Math.abs(oiChgPct) < 0.4) return null;
-  if (isDownDay)
-    return oiChgPct > 0 ? { label: "TRAP", css: "trap" } : { label: "UWD", css: "uwd" };
-  return oiChgPct > 0 ? { label: "BULL", css: "bull" } : { label: "UWD", css: "uwd" };
-}
-
-function classifyPe(oiChgPct, isDownDay) {
-  if (Math.abs(oiChgPct) < 0.4) return null;
-  if (isDownDay)
-    return oiChgPct > 0 ? { label: "BEAR", css: "bear" } : { label: "SCOV", css: "scov" };
-  return oiChgPct > 0 ? { label: "SCOV", css: "scov" } : { label: "UWD", css: "uwd" };
-}
-
-// ─── Derived metrics ────────────────────────────────────────────────────────
 
 function computeMetrics(strikes, spot) {
   let totalCeOI = 0, totalPeOI = 0;
@@ -51,45 +34,40 @@ function computeMetrics(strikes, spot) {
   });
 
   const pcr = totalCeOI > 0 ? +(totalPeOI / totalCeOI).toFixed(3) : 1.0;
-  const atm  = spot ? Math.round(spot / 50) * 50 : 0;
-
-  // ATM IV approximation (Brenner-Subrahmanyam)
-  const atmSide = strikes[String(atm)] || {};
-  const ceLtp   = atmSide.ce?.ltp || 0;
-  const peLtp   = atmSide.pe?.ltp || 0;
-  const T = 7 / 365;
-  const ivApprox = (ltp) =>
-    ltp && spot > 0 ? +((ltp / spot) * Math.sqrt((2 * Math.PI) / T) * 100).toFixed(1) : 0;
-  const ceIv = ivApprox(ceLtp);
-  const peIv = ivApprox(peLtp);
-  const atmIv = ceIv && peIv ? +((ceIv + peIv) / 2).toFixed(1) : ceIv || peIv;
-
-  // IV skew: OTM PE - OTM CE (1 strike each side from ATM)
-  const otmPe   = strikes[String(atm - 50)]?.pe?.ltp || 0;
-  const otmCe   = strikes[String(atm + 50)]?.ce?.ltp || 0;
-  const otmPeIv = ivApprox(otmPe);
-  const otmCeIv = ivApprox(otmCe);
-  const ivSkew  = otmPeIv && otmCeIv ? +(otmPeIv - otmCeIv).toFixed(1) : 0;
-
-  // Expected move: spot × IV × sqrt(1/252)
-  const expectedMove =
-    spot && atmIv ? +(spot * (atmIv / 100) * Math.sqrt(1 / 252)).toFixed(0) : 0;
 
   return {
-    spot,
-    pcr,
-    maxPain: 0,   // computed server-side and sent in guidance
-    atmIv,
-    ivSkew,
-    expectedMove,
-    totalCeOI,
-    totalPeOI,
-    maxCeStrike,
-    maxPeStrike,
+    spot, pcr, maxPain: 0, atmIv: 0, ivSkew: 0, expectedMove: 0,
+    totalCeOI, totalPeOI, maxCeStrike, maxPeStrike,
   };
 }
 
-// ─── Hook ───────────────────────────────────────────────────────────────────
+function mapGuidance(g) {
+  return {
+    warmingUp:     !!g.warming_up,
+    message:       g.message,
+    score:         g.score ?? 0,
+    bias:          g.bias,
+    rawBias:       g.raw_bias,
+    confidence:    g.confidence ?? 0,
+    pendingBias:   g.pending_bias,
+    pendingCount:  g.pending_count ?? 0,
+    confirmCycles: g.confirm_cycles ?? 2,
+    biasSince:     g.bias_since,
+    signals:       g.signals       || [],
+    flags:         g.flags         || [],
+    opportunities: g.opportunities || [],
+    spikeAlerts:   g.spike_alerts  || [],
+    strikeSignals: g.strike_signals || {},
+    pcr:           g.pcr,
+    maxPain:       g.max_pain,
+    ivSkew:        g.iv_skew,
+    atmIv:         g.atm_iv,
+    expectedMove:  g.expected_move,
+    evaluatedAt:   g.evaluated_at,
+    windowMin:     g.window_min,
+    historyMinutes: g.history_minutes ?? 0,
+  };
+}
 
 export function useOptionStream() {
   const [chainData,    setChainData]    = useState({ strikes: {}, expiry: null, atm: 0 });
@@ -128,26 +106,18 @@ export function useOptionStream() {
             connected: data.connected,
           });
 
-          setMetrics(computeMetrics(strikes, spot));
-
-          if (data.guidance) {
-            // Merge server-side max_pain into metrics
-            setMetrics(prev => prev
-              ? { ...prev, maxPain: data.guidance.max_pain || prev.maxPain }
-              : prev
-            );
-            setGuidance({
-              score:         data.guidance.score,
-              bias:          data.guidance.bias,
-              confidence:    data.guidance.confidence,
-              signals:       data.guidance.signals       || [],
-              opportunities: data.guidance.opportunities || [],
-              spikeAlerts:   data.guidance.spike_alerts  || [],
-              pcr:           data.guidance.pcr,
-              maxPain:       data.guidance.max_pain,
-              ivSkew:        data.guidance.iv_skew,
-            });
+          const base = computeMetrics(strikes, spot);
+          const g = data.guidance;
+          if (g && !g.warming_up) {
+            if (g.pcr != null)           base.pcr = g.pcr;
+            if (g.max_pain != null)      base.maxPain = g.max_pain;
+            if (g.atm_iv != null)        base.atmIv = g.atm_iv;
+            if (g.iv_skew != null)       base.ivSkew = g.iv_skew;
+            if (g.expected_move != null) base.expectedMove = g.expected_move;
           }
+          setMetrics(base);
+
+          if (g) setGuidance(mapGuidance(g));
         } catch (_) {}
       };
 
@@ -172,13 +142,5 @@ export function useOptionStream() {
     };
   }, [connect]);
 
-  return {
-    chainData,
-    metrics,
-    guidance,
-    isConnected,
-    error,
-    classifyCe,
-    classifyPe,
-  };
+  return { chainData, metrics, guidance, isConnected, error };
 }
