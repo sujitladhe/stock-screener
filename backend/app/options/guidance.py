@@ -82,6 +82,7 @@ SPIKE_VOI_MIN = 0.6
 
 # selling opportunities
 MIN_SELL_DIST = 50
+MIN_SELL_PREMIUM = 10.0       # never suggest selling an option trading below this (Rs)
 CE_WALL_OI_MIN = 40_000
 PE_WALL_OI_MIN = 50_000
 VOI_MAX_FOR_SELL = 0.55
@@ -323,6 +324,8 @@ def spike_card(spike: dict) -> Optional[dict]:
     px = spike.get("px_chg_pct")
     if px is None or px <= 0:
         return None
+    if spike.get("ltp") is None or spike["ltp"] < MIN_SELL_PREMIUM:
+        return None                       # premium too small to be worth selling
     conf = 60
     if spike["oi_chg_pct"] >= 8:
         conf += 5
@@ -336,7 +339,7 @@ def spike_card(spike: dict) -> Optional[dict]:
         "confidence": conf, "is_spike": True,
         "reasons": [
             f"OI surged {spike['oi_chg_pct']:+.1f}% in {spike['window_min']} min (fresh positioning)",
-            f"V/OI {spike['voi']:.2f}, premium up {px:.1f}% - now elevated",
+            f"V/OI {spike['voi']:.2f}, premium up {px:.1f}% - now Rs {spike['ltp']:.2f}",
             f"{spike['dist_from_spot']} pts OTM - weak directional justification",
             spike["verdict"],
         ],
@@ -367,6 +370,9 @@ def _walls(side: str, new: dict, sigs: dict) -> List[dict]:
         oi = e.get(f"{side}_oi") or 0
         if oi < oi_min:
             continue
+        ltp = e.get(f"{side}_ltp")
+        if ltp is None or ltp < MIN_SELL_PREMIUM:
+            continue                      # not enough premium to be worth selling
         cands.append((oi, strike, dist, e))
     cands.sort(key=lambda c: (-c[0], c[1]))
     walls = []
@@ -376,6 +382,7 @@ def _walls(side: str, new: dict, sigs: dict) -> List[dict]:
         walls.append({
             "side": side, "strike": int(strike), "oi": int(oi), "dist": float(dist),
             "rank": rank, "voi": voi, "sig": (sigs.get(strike) or {}).get(side),
+            "ltp": float(e.get(f"{side}_ltp")),
         })
     return walls
 
@@ -422,6 +429,7 @@ def _score_wall(wall: dict, strength: int) -> Optional[dict]:
     if wall["dist"] >= 200:
         conf += 5
     reasons.append(f"Distance: {wall['dist']:.0f} pts from spot")
+    reasons.append(f"Premium to earn: Rs {wall['ltp']:.2f}")
     if strength >= 4:
         conf += 5
     return {"conf": min(conf, 95), "reasons": reasons}
