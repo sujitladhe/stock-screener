@@ -21,6 +21,10 @@ Why candles_last_synced_date instead of comparing last candle date to today:
   (last trading day) even after a successful sync. Comparing that against date.today()
   would always trigger a re-fetch for every stock, making a second run just as slow
   as the first. Tracking WHEN the sync ran (not what was stored) eliminates this.
+
+FIX in this version: the db.rollback() in fetch_and_store_all was indented
+one level too deep (a syntax error that stopped the whole module from loading),
+and `result` could be undefined after a failure. Both are corrected.
 """
 
 import time
@@ -265,6 +269,7 @@ def fetch_and_store_all(
     skipped = 0
 
     for i, instrument in enumerate(instruments, start=1):
+        result = None
         try:
             result = fetch_and_store_one(db, instrument, today)
             if result["status"] in ("skipped_today", "up_to_date", "no_data"):
@@ -273,16 +278,17 @@ def fetch_and_store_all(
                 succeeded.append(result)
         except Exception as e:
             failed.append({"symbol": instrument.trading_symbol, "error": str(e)})
-                db.rollback()
+            db.rollback()  # partial writes from a failed stock must never leak into the next commit
+
         if i % 50 == 0 or i == len(instruments):
             print(
                 f"  Progress: {i}/{len(instruments)} "
                 f"(updated: {len(succeeded)}, skipped: {skipped}, failed: {len(failed)})"
             )
 
-        # Only throttle when an API call was actually made (not for skipped stocks)
-        # skipped_today means no API call → no need to sleep
-        if result.get("status") != "skipped_today":
+        # Only throttle when an API call was (or may have been) made.
+        # skipped_today means no API call → no need to sleep.
+        if result is None or result.get("status") != "skipped_today":
             time.sleep(throttle_seconds)
 
     return {
