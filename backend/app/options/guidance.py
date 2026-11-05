@@ -17,16 +17,29 @@ What changed compared with the old tick-by-tick version
   * CONFIRMED OPPORTUNITIES – a card appears only after it persisted for
                   OPP_APPEAR cycles and is removed only after it has been
                   missing for OPP_DISAPPEAR cycles.
-  * OI CLASSIFICATION is per strike: option PRICE change vs OI change over the
-                  look-back window (long buildup, short buildup, short
-                  covering, long unwinding) — no more global "down day" guess.
-  * IV uses a real Black-Scholes solve with the true time to expiry.
+  * OI CLASSIFICATION is per strike: the change in that strike's IMPLIED
+                  VOLATILITY vs the change in its OI over the look-back window.
+                  An option's price mostly just follows NIFTY (and decays with
+                  time), so price can't tell writers from buyers; IV can:
+                    OI up   + IV down = writers adding   (TRAP on calls, SUPT on puts)
+                    OI up   + IV up   = buyers adding    (BULL on calls, BEAR on puts)
+                    OI down + IV up   = writers covering (SCOV on calls, PCOV on puts)
+                    OI down + IV down = buyers leaving   (UWD)
+                  Only ATM/OTM strikes are classified (ITM IV is unreliable), and
+                  each strike's vote is WEIGHTED by the contracts added/removed.
+  * IV uses a real Black-Scholes solve with the true time to expiry, priced off
+                  the FORWARD implied by put-call parity at ATM (not spot), so
+                  call/put IV are comparable and skew is not biased by carry.
+  * PCR is OTM-only (puts below spot / calls above spot) = writer positioning;
+                  its change since the open is shown alongside.
+  * IV skew votes on its DEVIATION from its own recent baseline, not on a fixed
+                  threshold (NIFTY puts are structurally pricier than calls).
   * Fake spike = OI surge over the last ~10 minutes (not vs yesterday).
 
 Scoring (same structure as the original design, range -5 .. +5):
-  PCR            : +-1 (0.85 / 1.15), +-2 at extremes (0.70 / 1.30)
-  IV skew        : +-1 (beyond +-1.5)
-  OI class count : +-1
+  PCR (OTM)      : +-1 (0.85 / 1.15), +-2 at extremes (0.70 / 1.30)
+  IV skew        : +-1 (skew vs its own baseline, beyond +-0.5 vol pts)
+  OI class       : +-1 (contract-weighted writer/buyer vote)
   Spot vs pain   : +-1 (with a small dead zone)
   ATM IV level   : flag only (no vote)
   Bias: score <= -3 Bearish, >= +3 Bullish, otherwise Neutral/Range.
@@ -36,7 +49,7 @@ All the tunable numbers are in the CONSTANTS block just below.
 
 import logging
 import math
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timedelta
 from statistics import mean, median
 from typing import Dict, List, Optional, Tuple
 
@@ -61,19 +74,27 @@ SPIKE_APPEAR = 1              # spikes are time-sensitive: shown immediately
 SPIKE_DISAPPEAR = 2
 MAX_OPPS = 3                  # top opportunities shown
 
-PCR_BEAR, PCR_BULL = 0.85, 1.15
+PCR_BEAR, PCR_BULL = 0.85, 1.15      # applied to the OTM-only PCR - calibrate from the decision log
 PCR_STRONG_BEAR, PCR_STRONG_BULL = 0.70, 1.30
-SKEW_THRESHOLD = 1.5
+OPEN_REF_TIME = dtime(9, 30)  # "since open" references start here (OI is still settling before)
 MAXPAIN_MARGIN = 50           # dead zone around max pain (points)
 IV_HIGH, IV_LOW = 20.0, 11.0
 
-# per-strike OI classification
+# forward price (put-call parity at ATM) used as the IV underlying
+FWD_MAX_DEV = 0.02            # ignore a parity forward more than 2% away from spot (stale LTP)
+
+# IV skew vs its own baseline
+SKEW_BASE_WINDOW_MIN = 120    # baseline = median skew of the last this-many minutes of today ...
+SKEW_BASE_MIN_BUCKETS = 30    # ... needs at least this many 1-minute readings (no vote before that)
+SKEW_DEV_THRESHOLD = 0.5      # vol points above/below baseline needed to vote
+
+# per-strike OI classification (IV change vs OI change)
 OI_MIN_PCT = 1.0              # OI must change by at least this % in the window
-PX_MIN_PCT = 1.0              # option price must change by at least this %
-PX_MIN_ABS = 0.05             # ... and at least one tick
+IV_MIN_CHG_PTS = 0.30         # strike IV must move by at least this many vol points
+MIN_LTP_FOR_IV = 3.0          # ignore options priced below this (IV from a tiny LTP is noise)
 MIN_OI_FOR_CLASS = 20_000     # ignore strikes with tiny open interest
-VOTE_MARGIN_MIN = 3           # OI-class vote needs a lead of at least this many rows
-VOTE_MARGIN_PCT = 0.15        # ... or this share of all classified rows
+VOTE_SHARE_MIN = 0.20         # OI-class vote needs weighted net share (bull-bear)/(bull+bear) of this
+VOTE_MIN_ROWS = 3             # ... and at least this many directional (bull/bear) rows
 
 # fake spike (all three must be true)
 SPIKE_OTM_MIN_PTS = 200
@@ -160,13 +181,52 @@ def compute_max_pain(strikes: dict) -> Optional[int]:
     return best
 
 
-def _iv_of(entry: Optional[dict], side: str, spot: float, strike: int, t: float) -> Optional[float]:
+def forward_price(strikes: dict, spot: float) -> float:
+    """
+    Forward implied by put-call parity at the strikes nearest ATM:
+    F = K + C - P  (median of up to 3 strikes). Option prices are quoted off the
+    FORWARD, not spot, so pricing IV off spot inflates call IV and deflates put
+    IV by the cost of carry. Falls back to spot if no sane parity forward exists.
+    """
+    atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
+    cands = []
+    for k in (atm - STRIKE_STEP, atm, atm + STRIKE_STEP):
+        e = strikes.get(k)
+        if not e:
+            continue
+        c, p = e.get("ce_ltp"), e.get("pe_ltp")
+        if c and p and c > 0 and p > 0:
+            f = k + c - p
+            if abs(f / spot - 1.0) <= FWD_MAX_DEV:
+                cands.append(f)
+    return float(median(cands)) if cands else float(spot)
+
+
+def _iv_of(entry: Optional[dict], side: str, und: float, strike: int, t: float) -> Optional[float]:
     if not entry:
         return None
-    return implied_vol(entry.get(f"{side}_ltp"), spot, strike, t, side == "ce")
+    return implied_vol(entry.get(f"{side}_ltp"), und, strike, t, side == "ce")
 
 
-def bucket_metrics(b: dict) -> dict:
+def otm_pcr(b: dict) -> Optional[float]:
+    """
+    OTM-only put/call ratio: PE OI of strikes BELOW spot / CE OI of strikes ABOVE
+    spot (within the decision range). ITM OI is mostly hedges/arbitrage, not
+    writing, so it is left out. Returns None if there is no OTM call OI.
+    """
+    spot, strikes = b["spot"], b["strikes"]
+    lo, hi = spot - DECISION_RANGE_PTS, spot + DECISION_RANGE_PTS
+    ce_otm = pe_otm = 0
+    for k, e in strikes.items():
+        if k > spot and k <= hi:
+            ce_otm += e.get("ce_oi") or 0
+        elif k < spot and k >= lo:
+            pe_otm += e.get("pe_oi") or 0
+    return (pe_otm / ce_otm) if ce_otm > 0 else None
+
+
+def total_pcr(b: dict) -> Optional[float]:
+    """Old-style PCR (all strikes within the range, ITM included) - reference only."""
     spot, strikes = b["spot"], b["strikes"]
     lo, hi = spot - DECISION_RANGE_PTS, spot + DECISION_RANGE_PTS
     ce_tot = pe_tot = 0
@@ -174,28 +234,42 @@ def bucket_metrics(b: dict) -> dict:
         if lo <= k <= hi:
             ce_tot += e.get("ce_oi") or 0
             pe_tot += e.get("pe_oi") or 0
-    pcr = (pe_tot / ce_tot) if ce_tot > 0 else None
+    return (pe_tot / ce_tot) if ce_tot > 0 else None
 
+
+def skew_of_bucket(b: dict) -> Optional[float]:
+    """Put IV minus call IV (vol points) at equal distance from ATM, forward-based."""
+    spot, strikes = b["spot"], b["strikes"]
+    fwd = forward_price(strikes, spot)
+    atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
+    t = years_to_expiry(b["ts"], b["expiry"])
+    for d in (150, 100, 50):
+        pe_iv = _iv_of(strikes.get(atm - d), "pe", fwd, atm - d, t)
+        ce_iv = _iv_of(strikes.get(atm + d), "ce", fwd, atm + d, t)
+        if pe_iv is not None and ce_iv is not None:
+            return pe_iv - ce_iv
+    return None
+
+
+def bucket_metrics(b: dict) -> dict:
+    spot, strikes = b["spot"], b["strikes"]
+    fwd = forward_price(strikes, spot)
     atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
     t = years_to_expiry(b["ts"], b["expiry"])
 
     ivs = []
     atm_entry = strikes.get(atm)
     for side in ("ce", "pe"):
-        v = _iv_of(atm_entry, side, spot, atm, t)
+        v = _iv_of(atm_entry, side, fwd, atm, t)
         if v is not None:
             ivs.append(v)
     atm_iv = (sum(ivs) / len(ivs)) if ivs else None
 
-    skew = None
-    for d in (150, 100, 50):
-        pe_iv = _iv_of(strikes.get(atm - d), "pe", spot, atm - d, t)
-        ce_iv = _iv_of(strikes.get(atm + d), "ce", spot, atm + d, t)
-        if pe_iv is not None and ce_iv is not None:
-            skew = pe_iv - ce_iv
-            break
-
-    return {"pcr": pcr, "max_pain": compute_max_pain(strikes), "atm_iv": atm_iv, "iv_skew": skew}
+    return {
+        "pcr": otm_pcr(b), "pcr_total": total_pcr(b),
+        "max_pain": compute_max_pain(strikes),
+        "atm_iv": atm_iv, "iv_skew": skew_of_bucket(b), "fwd": fwd,
+    }
 
 
 def smoothed_metrics(buckets: List[dict]) -> dict:
@@ -208,15 +282,19 @@ def smoothed_metrics(buckets: List[dict]) -> dict:
     mp = [m["max_pain"] for m in ms if m.get("max_pain")]
     max_pain = int(round(median(mp) / STRIKE_STEP) * STRIKE_STEP) if mp else None
     return {
-        "pcr": avg("pcr", 3), "atm_iv": avg("atm_iv", 2), "iv_skew": avg("iv_skew", 2),
-        "max_pain": max_pain, "n": len(ms),
+        "pcr": avg("pcr", 3), "pcr_total": avg("pcr_total", 3),
+        "atm_iv": avg("atm_iv", 2), "iv_skew": avg("iv_skew", 2),
+        "fwd": avg("fwd", 1), "max_pain": max_pain, "n": len(ms),
     }
 
 
 # ---------------------------------------------------------------------------
-# Per-strike OI classification (price change vs OI change over the window)
+# Per-strike OI classification (IV change vs OI change over the window)
 # ---------------------------------------------------------------------------
-# (price direction, OI direction) -> (label, css class, direction vote)
+# (IV direction, OI direction) -> (label, css class, direction vote)
+# An option's IV (not its price) is used: price mostly follows NIFTY and decays
+# with time, IV tells buyers (IV rises as they pay up) from writers (IV falls as
+# they hit bids).
 _CE_MAP = {
     ("up", "up"):     ("BULL", "bull", +1),   # call buyers adding
     ("down", "up"):   ("TRAP", "trap", -1),   # call writers adding = resistance
@@ -231,42 +309,76 @@ _PE_MAP = {
 }
 
 
-def classify_side(side, oi_now, oi_then, px_now, px_then) -> Optional[dict]:
+def classify_side(side: str, strike: int, e: dict, o: dict,
+                  und_now: float, t_now: float, und_then: float, t_then: float) -> Optional[dict]:
+    """
+    Classifies one option (one strike, one side) from its OI change and its IV
+    change between bucket `o` (then) and bucket `e` (now). `weight` is the number
+    of contracts added/removed, used to weight this row's vote.
+    """
+    oi_now, oi_then = e.get(f"{side}_oi"), o.get(f"{side}_oi")
     if oi_now is None or oi_then is None or oi_then <= 0 or oi_now < MIN_OI_FOR_CLASS:
         return None
-    oi_chg_pct = (oi_now - oi_then) / oi_then * 100.0
-    out = {"label": None, "css": None, "vote": 0,
-           "oi_chg_pct": round(oi_chg_pct, 2), "px_chg_pct": None}
-    if px_now is None or px_then is None or px_then <= 0:
+    oi_chg = oi_now - oi_then
+    oi_chg_pct = oi_chg / oi_then * 100.0
+    out = {"label": None, "css": None, "vote": 0, "weight": 0,
+           "oi_chg": int(oi_chg), "oi_chg_pct": round(oi_chg_pct, 2),
+           "px_chg_pct": None, "iv_chg": None}
+
+    px_now, px_then = e.get(f"{side}_ltp"), o.get(f"{side}_ltp")
+    if px_now is not None and px_then is not None and px_then > 0:
+        out["px_chg_pct"] = round((px_now - px_then) / px_then * 100.0, 2)
+
+    # IV from a tiny premium is noise
+    if px_now is None or px_then is None or px_now < MIN_LTP_FOR_IV or px_then < MIN_LTP_FOR_IV:
         return out
-    px_chg = px_now - px_then
-    px_pct = px_chg / px_then * 100.0
-    out["px_chg_pct"] = round(px_pct, 2)
+    # no trades in the window -> the LTP may be stale while spot moved (fake IV change)
+    vol_now, vol_then = e.get(f"{side}_vol"), o.get(f"{side}_vol")
+    if vol_now is not None and vol_then is not None and vol_now <= vol_then:
+        return out
+
+    is_call = side == "ce"
+    iv_now = implied_vol(px_now, und_now, strike, t_now, is_call)
+    iv_then = implied_vol(px_then, und_then, strike, t_then, is_call)
+    if iv_now is None or iv_then is None:
+        return out
+    iv_chg = iv_now - iv_then
+    out["iv_chg"] = round(iv_chg, 2)
 
     oi_dir = "up" if oi_chg_pct >= OI_MIN_PCT else "down" if oi_chg_pct <= -OI_MIN_PCT else None
-    if abs(px_chg) >= PX_MIN_ABS and abs(px_pct) >= PX_MIN_PCT:
-        px_dir = "up" if px_chg > 0 else "down"
-    else:
-        px_dir = None
-    if oi_dir is None or px_dir is None:
+    iv_dir = "up" if iv_chg >= IV_MIN_CHG_PTS else "down" if iv_chg <= -IV_MIN_CHG_PTS else None
+    if oi_dir is None or iv_dir is None:
         return out
-    label, css, vote = (_CE_MAP if side == "ce" else _PE_MAP)[(px_dir, oi_dir)]
-    out.update({"label": label, "css": css, "vote": vote})
+    label, css, vote = (_CE_MAP if is_call else _PE_MAP)[(iv_dir, oi_dir)]
+    out.update({"label": label, "css": css, "vote": vote, "weight": int(abs(oi_chg))})
     return out
 
 
 def compute_strike_signals(new: dict, old: dict):
-    """Returns ({strike: {"ce":..,"pe":..}}, bull_rows, bear_rows, classified_rows)."""
+    """
+    Returns ({strike: {"ce":..,"pe":..}}, bull_rows, bear_rows, classified_rows,
+             bull_weight, bear_weight)
+    Only ATM/OTM options are classified (calls at/above ATM, puts at/below ATM):
+    ITM options trade near intrinsic, so their IV is unreliable.
+    """
     out, bull, bear, classified = {}, 0, 0, 0
+    bull_w = bear_w = 0
     spot = new["spot"]
+    atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
+    und_now = forward_price(new["strikes"], spot)
+    und_then = forward_price(old["strikes"], old["spot"])
+    t_now = years_to_expiry(new["ts"], new["expiry"])
+    t_then = years_to_expiry(old["ts"], old["expiry"])
     for strike, e in new["strikes"].items():
         if abs(strike - spot) > DECISION_RANGE_PTS:
             continue
         o = old["strikes"].get(strike)
         if not o:
             continue
-        ce = classify_side("ce", e.get("ce_oi"), o.get("ce_oi"), e.get("ce_ltp"), o.get("ce_ltp"))
-        pe = classify_side("pe", e.get("pe_oi"), o.get("pe_oi"), e.get("pe_ltp"), o.get("pe_ltp"))
+        ce = (classify_side("ce", strike, e, o, und_now, t_now, und_then, t_then)
+              if strike >= atm else None)
+        pe = (classify_side("pe", strike, e, o, und_now, t_now, und_then, t_then)
+              if strike <= atm else None)
         if ce or pe:
             out[strike] = {"ce": ce, "pe": pe}
         for c in (ce, pe):
@@ -274,9 +386,20 @@ def compute_strike_signals(new: dict, old: dict):
                 classified += 1
                 if c["vote"] > 0:
                     bull += 1
+                    bull_w += c["weight"]
                 elif c["vote"] < 0:
                     bear += 1
-    return out, bull, bear, classified
+                    bear_w += c["weight"]
+    return out, bull, bear, classified, bull_w, bear_w
+
+
+def _fmt_qty(n: float) -> str:
+    n = abs(n)
+    if n >= 1_00_000:
+        return f"{n / 1_00_000:.1f}L"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}K"
+    return f"{n:.0f}"
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +696,8 @@ class GuidanceEngine:
         self._spike_out: List[dict] = []
         self._spike_opp_out: List[dict] = []
         self.last_metrics: Optional[dict] = None
+        self._skew_cache: Dict[datetime, Optional[float]] = {}   # bucket ts -> skew
+        self._open_pcr: Optional[Tuple[date, float]] = None      # (day, PCR near the open)
         self.result: dict = self._warming("Waiting for market data...", None)
 
     # ----- state helpers ----------------------------------------------------
@@ -583,6 +708,8 @@ class GuidanceEngine:
             t.clear()
         self._regular_out, self._spike_out, self._spike_opp_out = [], [], []
         self.last_metrics = None
+        self._skew_cache.clear()
+        self._open_pcr = None
         self.result = self._warming("New trading day - collecting data...", None)
 
     def restore(self, bias, pending, pending_count, since) -> None:
@@ -608,8 +735,53 @@ class GuidanceEngine:
             "evaluated_at": new["ts"].isoformat() if new else None,
             "window_min": None,
             "history_minutes": self.store.minutes_of_data(),
-            "oi_votes": {"bull": 0, "bear": 0, "classified": 0},
+            "oi_votes": {"bull": 0, "bear": 0, "classified": 0, "bull_w": 0, "bear_w": 0},
+            "pcr_total": None, "pcr_chg_open": None, "skew_base": None, "skew_dev": None,
         }
+
+    # ----- baselines (skew vs its own recent level, PCR vs the open) ---------
+    def _skew_baseline(self, now_ts: datetime) -> Tuple[Optional[float], int]:
+        """
+        Median skew of today's readings from max(open ref, now-120min) up to just
+        before the smoothing window. Returns (baseline or None, readings used).
+        Skew per bucket is cached so it is only solved once.
+        """
+        day = now_ts.date()
+        lo = max(now_ts - timedelta(minutes=SKEW_BASE_WINDOW_MIN),
+                 datetime.combine(day, OPEN_REF_TIME))
+        hi = now_ts - timedelta(minutes=SMOOTH_BUCKETS)
+        live = set()
+        vals = []
+        for b in self.store.buckets:
+            ts = b["ts"]
+            live.add(ts)
+            if ts < lo or ts > hi or ts.date() != day:
+                continue
+            if ts not in self._skew_cache:
+                self._skew_cache[ts] = skew_of_bucket(b)
+            sk = self._skew_cache[ts]
+            if sk is not None:
+                vals.append(sk)
+        for ts in [k for k in self._skew_cache if k not in live]:
+            del self._skew_cache[ts]                  # drop buckets that left the store
+        if len(vals) < SKEW_BASE_MIN_BUCKETS:
+            return None, len(vals)
+        return float(median(vals)), len(vals)
+
+    def _pcr_at_open(self, now_ts: datetime) -> Optional[float]:
+        """Average OTM PCR over the first SMOOTH_BUCKETS buckets at/after OPEN_REF_TIME."""
+        day = now_ts.date()
+        if self._open_pcr and self._open_pcr[0] == day:
+            return self._open_pcr[1]
+        start = datetime.combine(day, OPEN_REF_TIME)
+        ref = [b for b in self.store.buckets if b["ts"] >= start and b["ts"].date() == day]
+        if len(ref) < SMOOTH_BUCKETS:
+            return None
+        vals = [v for v in (otm_pcr(b) for b in ref[:SMOOTH_BUCKETS]) if v is not None]
+        if not vals:
+            return None
+        self._open_pcr = (day, round(mean(vals), 3))
+        return self._open_pcr[1]
 
     def _update_bias(self, proposed: str, ts: datetime) -> bool:
         if self.bias_since is None:
@@ -681,52 +853,65 @@ class GuidanceEngine:
         old, win = pair
 
         sm = smoothed_metrics(self.store.recent(SMOOTH_BUCKETS))
-        sigs, bull, bear, classified = compute_strike_signals(new, old)
+        sigs, bull, bear, classified, bull_w, bear_w = compute_strike_signals(new, old)
         spot = new["spot"]
         signals: List[dict] = []
         score = 0
 
-        # 1) PCR
+        # 1) PCR - OTM only (puts below spot / calls above spot) = writer positioning
         pcr = sm["pcr"]
+        pcr_open = self._pcr_at_open(new["ts"])
+        pcr_chg_open = round(pcr - pcr_open, 3) if (pcr is not None and pcr_open is not None) else None
         if pcr is None:
-            v, note = 0, "No OI data yet"
+            v, note = 0, "No OTM OI data yet"
         elif pcr < PCR_STRONG_BEAR:
             v, note = -2, "Very low - heavy call writing, bearish"
         elif pcr < PCR_BEAR:
-            v, note = -1, "Low PCR - bearish lean"
+            v, note = -1, "Low OTM PCR - bearish lean"
         elif pcr > PCR_STRONG_BULL:
             v, note = 2, "Very high - heavy put writing, bullish"
         elif pcr > PCR_BULL:
-            v, note = 1, "High PCR - bullish lean"
+            v, note = 1, "High OTM PCR - bullish lean"
         else:
             v, note = 0, "Neutral range"
+        if pcr is not None:
+            note += (f"; {pcr_chg_open:+.2f} since open" if pcr_chg_open is not None
+                     else "; open reference not ready")
         score += v
-        signals.append(_sig("PCR", v, f"{pcr:.2f}" if pcr is not None else "-", note))
+        signals.append(_sig("PCR (OTM)", v, f"{pcr:.2f}" if pcr is not None else "-", note))
 
-        # 2) IV skew
+        # 2) IV skew - judged against its own recent baseline, not a fixed number
         skew = sm["iv_skew"]
+        skew_base, base_n = self._skew_baseline(new["ts"])
+        skew_dev = round(skew - skew_base, 2) if (skew is not None and skew_base is not None) else None
         if skew is None:
             v, note = 0, "Not enough option prices"
-        elif skew > SKEW_THRESHOLD:
-            v, note = -1, "Puts expensive - bearish lean"
-        elif skew < -SKEW_THRESHOLD:
-            v, note = 1, "Calls expensive - bullish lean"
+        elif skew_dev is None:
+            v, note = 0, f"Building baseline ({base_n}/{SKEW_BASE_MIN_BUCKETS} min of readings)"
+        elif skew_dev > SKEW_DEV_THRESHOLD:
+            v, note = -1, f"Puts richer than usual ({skew_dev:+.2f} vs baseline {skew_base:+.2f}) - bearish lean"
+        elif skew_dev < -SKEW_DEV_THRESHOLD:
+            v, note = 1, f"Calls richer than usual ({skew_dev:+.2f} vs baseline {skew_base:+.2f}) - bullish lean"
         else:
-            v, note = 0, "Balanced skew"
+            v, note = 0, f"Near baseline ({skew_dev:+.2f} vs {skew_base:+.2f})"
         score += v
         signals.append(_sig("IV Skew", v, f"{skew:+.1f}" if skew is not None else "-", note))
 
-        # 3) OI classification count (per strike, over the look-back window)
-        net = bull - bear
-        need = max(VOTE_MARGIN_MIN, int(VOTE_MARGIN_PCT * classified))
-        if net <= -need:
-            v, note = -1, "Trap / Bear / Put-cover rows dominate"
-        elif net >= need:
-            v, note = 1, "Bull / Scov / Support rows dominate"
+        # 3) OI classification - writer/buyer reading per strike (IV vs OI),
+        #    each row weighted by the contracts added/removed
+        tot_w = bull_w + bear_w
+        share = (bull_w - bear_w) / tot_w if tot_w > 0 else 0.0
+        dir_rows = bull + bear
+        if dir_rows < VOTE_MIN_ROWS:
+            v, note = 0, f"Too few directional rows ({dir_rows}); {win} min window"
+        elif share <= -VOTE_SHARE_MIN:
+            v, note = -1, f"Bearish writing/buying dominates by contracts ({share:+.0%}, {win} min)"
+        elif share >= VOTE_SHARE_MIN:
+            v, note = 1, f"Bullish writing/covering dominates by contracts ({share:+.0%}, {win} min)"
         else:
-            v, note = 0, f"Mixed ({win} min window)"
+            v, note = 0, f"Mixed ({share:+.0%} net, {win} min window)"
         score += v
-        signals.append(_sig("OI Class", v, f"Bull {bull} / Bear {bear}", note))
+        signals.append(_sig("OI Class", v, f"Bull {_fmt_qty(bull_w)} / Bear {_fmt_qty(bear_w)}", note))
 
         # 4) Spot vs max pain
         mp = sm["max_pain"]
@@ -785,7 +970,11 @@ class GuidanceEngine:
             "evaluated_at": new["ts"].isoformat(),
             "window_min": win,
             "history_minutes": self.store.minutes_of_data(),
-            "oi_votes": {"bull": bull, "bear": bear, "classified": classified},
+            "oi_votes": {"bull": bull, "bear": bear, "classified": classified,
+                         "bull_w": int(bull_w), "bear_w": int(bear_w)},
+            "pcr_total": sm["pcr_total"], "pcr_chg_open": pcr_chg_open,
+            "skew_base": round(skew_base, 2) if skew_base is not None else None,
+            "skew_dev": skew_dev,
         }
         self.result = res
         self.last_metrics = {

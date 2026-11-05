@@ -42,6 +42,8 @@ def save_decision(db: Session, result: dict) -> None:
             "iv_skew": result.get("iv_skew"), "atm_iv": result.get("atm_iv"),
             "expected_move": result.get("expected_move"),
             "oi_votes": result.get("oi_votes"), "window_min": result.get("window_min"),
+            "pcr_total": result.get("pcr_total"), "pcr_chg_open": result.get("pcr_chg_open"),
+            "skew_base": result.get("skew_base"), "skew_dev": result.get("skew_dev"),
         }),
         signals=_jsonable(result.get("signals")),
         opportunities=_jsonable(result.get("opportunities")),
