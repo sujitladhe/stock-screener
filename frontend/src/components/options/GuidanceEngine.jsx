@@ -8,7 +8,9 @@
 
 const BIAS_COLORS = {
   "BEARISH": "#ef4444",
+  "MILD BEARISH": "#f97316",
   "NEUTRAL": "#6b7280",
+  "MILD BULLISH": "#84cc16",
   "BULLISH": "#22c55e",
 };
 
@@ -139,7 +141,7 @@ export default function GuidanceEngine({ guidance }) {
     pendingBias, pendingCount, confirmCycles, biasSince, evaluatedAt, windowMin,
   } = guidance;
 
-  const spectrumLeft = `${((score + 5) / 10) * 100}%`;
+  const spectrumLeft = `${((score + 3) / 6) * 100}%`;   // score runs -3 .. +3
   const bColor = biasColor(bias);
 
   return (
@@ -185,7 +187,7 @@ export default function GuidanceEngine({ guidance }) {
 
       {signals.length > 0 && (
         <div className="opt-signals">
-          <div className="opt-signals__header">Signal breakdown{windowMin ? ` (OI window ${windowMin} min)` : ""}</div>
+          <div className="opt-signals__header">Why{windowMin ? ` (OI window ${windowMin} min)` : ""}</div>
           {signals.map((s, i) => <SignalRow key={i} signal={s} />)}
         </div>
       )}

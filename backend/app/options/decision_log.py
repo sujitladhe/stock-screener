@@ -39,11 +39,8 @@ def save_decision(db: Session, result: dict) -> None:
         confidence=result.get("confidence"),
         metrics=_jsonable({
             "pcr": result.get("pcr"), "max_pain": result.get("max_pain"),
-            "iv_skew": result.get("iv_skew"), "atm_iv": result.get("atm_iv"),
-            "expected_move": result.get("expected_move"),
-            "oi_votes": result.get("oi_votes"), "window_min": result.get("window_min"),
-            "pcr_total": result.get("pcr_total"), "pcr_chg_open": result.get("pcr_chg_open"),
-            "skew_base": result.get("skew_base"), "skew_dev": result.get("skew_dev"),
+            "window_min": result.get("window_min"),
+            "readings": result.get("readings"),
         }),
         signals=_jsonable(result.get("signals")),
         opportunities=_jsonable(result.get("opportunities")),
@@ -159,9 +156,9 @@ def get_stats(db: Session, days: int, now: datetime) -> dict:
         if r.spot_30m is None or not r.spot:
             continue
         move = (float(r.spot_30m) - float(r.spot)) / float(r.spot) * 100.0
-        if r.bias == "BULLISH":
+        if r.bias in ("BULLISH", "MILD BULLISH"):
             hit = move > 0
-        elif r.bias == "BEARISH":
+        elif r.bias in ("BEARISH", "MILD BEARISH"):
             hit = move < 0
         else:
             hit = abs(move) <= NEUTRAL_HIT_PCT
